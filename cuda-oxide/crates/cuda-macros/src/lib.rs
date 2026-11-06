@@ -40,6 +40,7 @@ mod launch_attrs;
 mod printf;
 mod ptx_asm;
 mod tile_export;
+mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -741,6 +742,39 @@ pub fn launch_bounds(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn launch_contract(attr: TokenStream, item: TokenStream) -> TokenStream {
     launch_attrs::launch_contract_entry(attr, item)
+}
+
+/// Declares formal verification obligations for a kernel, checked by Lean 4 at
+/// the `PostMem2Reg` `dialect-mir` stage.
+///
+/// Supported clauses name the kernel's slice and `DisjointSlice` parameters:
+/// - `no_oob_idx(a, b, c)`: every indexed read or write stays within `0..len`
+/// - `disjoint_writes(c)`: distinct launched threads never write the same slot
+/// - `writes_all_elems(c)`: every element in `0..c.len()` has a writer thread
+///
+/// ```ignore
+/// #[launch_contract(
+///     domain = 1,
+///     block = (256, 1, 1),
+///     requires = (a.len() >= c.len(), b.len() >= c.len()),
+/// )]
+/// #[verify(
+///     no_oob_idx(a, b, c),
+///     disjoint_writes(c),
+///     writes_all_elems(c),
+/// )]
+/// #[kernel]
+/// pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
+///     let idx = thread::index_1d();
+///     let idx_raw = idx.get();
+///     if let Some(c_elem) = c.get_mut(idx) {
+///         *c_elem = a[idx_raw] + b[idx_raw];
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn verify(attr: TokenStream, item: TokenStream) -> TokenStream {
+    verify::verify_entry(attr, item)
 }
 
 /// Specifies compile-time cluster dimensions for a kernel.

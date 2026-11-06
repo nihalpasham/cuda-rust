@@ -6,18 +6,30 @@ SPDX-License-Identifier: Apache-2.0
 import Init.Data.BitVec.Lemmas
 
 /-!
-Expression semantics for the first scalar exporter subset: pure functions with
-one basic block and same-width unsigned words (`u8`, `u16`, `u32`, or `u64`).
-The model permits any width; the exporter is responsible for rejecting widths
-and operations outside its supported subset.
+# Scalar `dialect-mir` Expression AST & Evaluator (`CudaOxide.Mir.Scalar`)
 
-Arithmetic wraps at the selected width. This module has no GPU execution or
-memory semantics and does not prove that a Rust-to-model bridge is correct.
+Defines the Lean representation for pure single-block `dialect-mir` expressions
+over same-width unsigned machine words (`ui8`, `ui16`, `ui32`, `ui64`):
+
+```text
+  dialect-mir operation                  CudaOxide.Mir.Scalar.Expr
+  ──────────────────────────────────     ──────────────────────────────────────
+  ^entry(arg_i: uiW)                     `Expr.arg ⟨i, by decide⟩`
+  mir.constant / builtin.constant        `Expr.literal (BitVec.ofNat W v)`
+  mir.add (lhs, rhs)                     `Expr.add lhs rhs`
+  mir.sub (lhs, rhs)                     `Expr.sub lhs rhs`
+  mir.mul (lhs, rhs)                     `Expr.mul lhs rhs`
+```
+
+Arithmetic wraps modulo `2 ^ width` via `BitVec width`. When a 1D launch bound
+proves `block * blockSize + lane < 2 ^ width`, `mul_add_toNat_of_lt` bridges
+the `BitVec` evaluation to the exact natural formula `CudaOxide.Mir.globalIndex`.
 -/
-namespace CudaOxide.Model.Scalar
+namespace CudaOxide.Mir.Scalar
 
-/-- An expression whose arguments and intermediate values share one word width.
-    An argument reference carries evidence that its index is below the arity. -/
+/-- An SSA scalar expression whose arguments and intermediate values share one
+    unsigned machine-word `width` (`8`, `16`, `32`, or `64`). Each argument
+    reference carries a `Fin arity` proof that its index is in range. -/
 inductive Expr (width arity : Nat) where
   | arg (index : Fin arity)
   | literal (value : BitVec width)
@@ -25,7 +37,7 @@ inductive Expr (width arity : Nat) where
   | sub (lhs rhs : Expr width arity)
   | mul (lhs rhs : Expr width arity)
 
-/-- Evaluate a scalar expression with exact wrapping word arithmetic. -/
+/-- Evaluate a scalar MIR expression with exact wrapping `BitVec` arithmetic. -/
 def Expr.eval {width arity : Nat} (expr : Expr width arity)
     (inputs : Fin arity → BitVec width) : BitVec width :=
   match expr with
@@ -55,8 +67,8 @@ def Expr.eval {width arity : Nat} (expr : Expr width arity)
     (inputs : Fin arity → BitVec width) :
     (Expr.mul lhs rhs).eval inputs = lhs.eval inputs * rhs.eval inputs := rfl
 
-/-- Wrapping multiply-add agrees with natural arithmetic when the full natural
-    result fits. This is an arithmetic lemma, not a source translation proof. -/
+/-- Wrapping `BitVec` multiply-add agrees with natural arithmetic when the
+    unwrapped result fits in `2 ^ width`. -/
 theorem mul_add_toNat_of_lt {width : Nat} (block blockSize lane : Nat)
     (hfit : block * blockSize + lane < 2 ^ width) :
     (BitVec.ofNat width block * BitVec.ofNat width blockSize +
@@ -64,4 +76,4 @@ theorem mul_add_toNat_of_lt {width : Nat} (block blockSize lane : Nat)
   rw [← BitVec.ofNat_mul, ← BitVec.ofNat_add]
   exact Nat.mod_eq_of_lt hfit
 
-end CudaOxide.Model.Scalar
+end CudaOxide.Mir.Scalar

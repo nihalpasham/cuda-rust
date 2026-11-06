@@ -514,6 +514,7 @@ dependencies = [
  "dialect-mir",
  "dialect-nvvm",
  "iket-lower",
+ "lean-exporter",
  "libloading",
  "libnvvm-sys",
  "llvm-export",

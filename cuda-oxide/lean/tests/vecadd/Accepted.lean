@@ -3,37 +3,28 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -/
 
-import CudaOxide.Proofs.Bounds
-import CudaOxide.Proofs.Launch
+import CudaOxide
 
--- This fixture instantiates reusable facts for the mathematical access
--- obligations of guarded vecadd. It illustrates the shape of future generated
--- obligations; the intended verifier will generate these applications.
--- This fixture does not parse Rust or connect the model to an actual kernel.
+-- Instantiates reusable facts for the access contracts of guarded vecadd:
+-- `no_oob_idx(a, b, c)`, `disjoint_writes(c)`, and `writes_all_elems(c)`.
 namespace Accepted
-open CudaOxide.Model CudaOxide.Proofs.Bounds CudaOxide.Proofs.Launch
+open CudaOxide.Mir CudaOxide.Contracts CudaOxide.Proofs.Bounds CudaOxide.Proofs.Launch
 
-theorem bounds {aLen bLen outLen blockSize block lane : Nat}
-    (ha : outLen ≤ aLen) (hb : outLen ≤ bLen)
-    (active : globalIndex blockSize block lane < outLen) :
-    globalIndex blockSize block lane < aLen ∧
-    globalIndex blockSize block lane < bLen ∧
-    globalIndex blockSize block lane < outLen := by
-  exact ⟨index_lt_of_guard active ha, index_lt_of_guard active hb, active⟩
+theorem no_oob_idx_all {aLen bLen outLen blockSize : Nat}
+    (ha : outLen ≤ aLen) (hb : outLen ≤ bLen) :
+    NoOobIdx blockSize 0 outLen aLen ∧
+    NoOobIdx blockSize 0 outLen bLen ∧
+    NoOobIdx blockSize 0 outLen outLen := by
+  exact ⟨no_oob_idx_of_guard_le ha, no_oob_idx_of_guard_le hb, no_oob_idx_of_same_len⟩
 
-theorem uniqueWrites {blockSize block₁ block₂ lane₁ lane₂ : Nat}
-    (hlane₁ : lane₁ < blockSize) (hlane₂ : lane₂ < blockSize)
-    (hsame : globalIndex blockSize block₁ lane₁ =
-      globalIndex blockSize block₂ lane₂) :
-    block₁ = block₂ ∧ lane₁ = lane₂ := by
-  exact globalIndex_injective hlane₁ hlane₂ hsame
+theorem disjoint_writes_c {blockSize : Nat} :
+    DisjointWrites blockSize 0 := by
+  exact disjoint_writes_1d
 
-theorem coverage {blocks blockSize outLen i : Nat}
-    (hpositive : 0 < blockSize) (hlaunch : outLen ≤ blocks * blockSize)
-    (hi : i < outLen) :
-    ∃ block lane : Nat, block < blocks ∧ lane < blockSize ∧
-      globalIndex blockSize block lane = i := by
-  exact launch_coverage hpositive hlaunch hi
+theorem writes_all_elems_c {blocks blockSize outLen : Nat}
+    (hpositive : 0 < blockSize) (hlaunch : outLen ≤ blocks * blockSize) :
+    WritesAllElems blocks blockSize outLen := by
+  exact writes_all_elems_1d hpositive hlaunch
 
 -- Construct a thread using checked block and lane coordinates.
 def lastThread : Thread1D 4 256 :=
@@ -51,15 +42,19 @@ example (i : Nat) (hi : i < 1000) :
       globalIndex 256 block lane = i := by
   exact launch_coverage (by omega) (by omega) hi
 
-#print axioms bounds
-#print axioms uniqueWrites
-#print axioms coverage
+#print axioms no_oob_idx_all
+#print axioms disjoint_writes_c
+#print axioms writes_all_elems_c
 #print axioms index_lt_of_guard
+#print axioms no_oob_idx_of_guard_le
+#print axioms no_oob_idx_of_same_len
 #print axioms launched_index_bound
 #print axioms launched_index_fits
 #print axioms launched_index_not_sentinel
 #print axioms globalIndex_injective
+#print axioms disjoint_writes_1d
 #print axioms launch_coverage
+#print axioms writes_all_elems_1d
 #print axioms thread_index_bound
 #print axioms thread_address
 #print axioms thread_index_injective

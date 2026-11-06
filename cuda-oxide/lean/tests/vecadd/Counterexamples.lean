@@ -4,11 +4,11 @@ SPDX-License-Identifier: Apache-2.0
 -/
 
 import Lean
-import CudaOxide.Model.Launch
+import CudaOxide.Mir.Launch
 
 /-! Proved counterexamples for broken mathematical access patterns. -/
 namespace Counterexamples
-open CudaOxide.Model
+open CudaOxide.Mir
 
 /-- If the output guard uses `≤` instead of `<`, its boundary lane is invalid. -/
 theorem broken_inclusive_guard :

@@ -1454,6 +1454,44 @@ pub fn __nounroll_config() {
     // No runtime code is generated.
 }
 
+/// Internal compiler marker recording a `lhs.len() >= rhs.len()` precondition
+/// from `#[launch_contract(requires = (...))]`.
+///
+/// Consumed and stripped during MIR import so `lean-exporter` can supply the
+/// host-checked slice-length relation as a hypothesis to Lean proofs.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __launch_contract_requires_len_ge_config<
+    const LHS_PARAM: usize,
+    const RHS_PARAM: usize,
+>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Internal compiler marker recording a `no_oob_idx(param)` obligation from
+/// `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_no_oob_idx_config<const PARAM: usize>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Internal compiler marker recording a `disjoint_writes(param)` obligation
+/// from `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_disjoint_writes_config<const PARAM: usize>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Internal compiler marker recording a `writes_all_elems(param)` obligation
+/// from `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_writes_all_elems_config<const PARAM: usize>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
 #[cfg(test)]
 mod tests {
     use super::block_linear_thread_id;

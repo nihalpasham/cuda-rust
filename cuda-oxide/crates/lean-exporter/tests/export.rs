@@ -19,6 +19,7 @@ use pliron::{
 };
 
 const FIXTURE: &str = include_str!("../fixtures/arithmetic.mir");
+const VECADD_FIXTURE: &str = include_str!("../fixtures/vecadd.mir");
 
 fn export(source: &str) -> String {
     export_named_source(source, "global_index").expect("valid scalar MIR")
@@ -62,7 +63,7 @@ fn parsed() -> (Context, Ptr<Operation>) {
 #[test]
 fn exports_actual_ssa_and_preserves_operand_order() {
     let baseline = export(FIXTURE);
-    assert!(baseline.contains("def program : CudaOxide.Model.Scalar.Expr 64 3"));
+    assert!(baseline.contains("def program : CudaOxide.Mir.Scalar.Expr 64 3"));
     assert!(baseline.contains(".mul arg0 arg1"));
     assert!(baseline.contains(".add v0 arg2"));
     assert!(
@@ -338,4 +339,23 @@ fn cli_inspect_shows_the_exact_input_and_export_only_after_success() {
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("was not found"));
+}
+
+#[test]
+fn exports_verified_vecadd_kernel_and_rejects_unguarded_accesses() {
+    let lean = export_named_source(VECADD_FIXTURE, "vecadd").expect("valid verified vecadd MIR");
+    assert!(lean.contains("def kernelSummary : CudaOxide.Mir.Kernel.KernelSummary1D 3"));
+    assert!(lean.contains("theorem verify_no_oob_idx_param0"));
+    assert!(lean.contains("theorem verify_no_oob_idx_param1"));
+    assert!(lean.contains("theorem verify_no_oob_idx_param2"));
+    assert!(lean.contains("theorem verify_disjoint_writes_param2"));
+    assert!(lean.contains("theorem verify_writes_all_elems_param2"));
+
+    // Moving a load into the unguarded exit block must be rejected fail-closed.
+    let unguarded = VECADD_FIXTURE.replace(
+        "^exit():\n    mir.return",
+        "^exit():\n    bad_ptr = mir.extract_field (a) [] [index: mir.field_index 0]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;\n    bad_elem = mir.ptr_offset (bad_ptr, idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;\n    bad_val = mir.load (bad_elem) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>) -> (builtin.fp32)>;\n    mir.return",
+    );
+    let err = export_named_source(&unguarded, "vecadd").unwrap_err();
+    assert!(err.to_string().contains("unguarded read"));
 }

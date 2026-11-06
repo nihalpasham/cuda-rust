@@ -3,12 +3,12 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -/
 
-import CudaOxide.Model.Scalar
-import CudaOxide.Model.Launch
+import CudaOxide.Mir.Scalar
+import CudaOxide.Mir.Launch
 
 /-! Checks for word overflow, expression structure, and argument ordering. -/
 namespace ScalarTests
-open CudaOxide.Model.Scalar
+open CudaOxide.Mir.Scalar
 
 private def noInputs {width : Nat} : Fin 0 → BitVec width := Fin.elim0
 
@@ -52,13 +52,11 @@ example :
   decide
 
 -- The arithmetic mapping to the natural launch model needs an explicit bound.
--- It still does not establish that any particular Rust function was exported
--- correctly, or that a computed address satisfies the stricter sentinel bound.
 example (block blockSize lane : Nat)
     (hfit : block * blockSize + lane < 2 ^ 64) :
     (BitVec.ofNat 64 block * BitVec.ofNat 64 blockSize +
       BitVec.ofNat 64 lane).toNat =
-      CudaOxide.Model.globalIndex blockSize block lane := by
+      CudaOxide.Mir.globalIndex blockSize block lane := by
   exact mul_add_toNat_of_lt block blockSize lane hfit
 
 #print axioms mul_add_toNat_of_lt

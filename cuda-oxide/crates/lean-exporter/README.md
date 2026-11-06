@@ -3,47 +3,71 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Scalar MIR to Lean exporter
+# `dialect-mir` to Lean 4 Exporter (`lean-exporter`)
 
-This experimental exporter reads a selected `mir.func` and translates its actual
-SSA operations into `CudaOxide.Model.Scalar.Expr`. It accepts exactly one block,
-one result, and arguments/results all of the same unsigned 8-, 16-, 32-, or 64-bit
-integer type. Constants and `mir.add`, `mir.sub`, `mir.mul`, and `mir.return` are
-supported. Integer arithmetic is modular, represented by Lean `BitVec`, including
-overflow and subtraction underflow.
+Turns `cuda-oxide`'s `dialect-mir` into Lean 4 code so Lean can prove kernel safety properties (`no_oob_idx`, `disjoint_writes`, `writes_all_elems`) before the compiler emits PTX.
 
-To inspect both the input MIR and generated Lean in one command, run from the
-`cuda-oxide/` workspace directory:
+---
+
+## How It Works: One Typed SSA Lookup Table (`SsaEnv`)
+
+By the time `lean-exporter` runs (at `PostMem2Reg`), `dialect-mir` is already in **SSA form**: every instruction produces a numbered Pliron `Value`, and later instructions pass those `Value`s as inputs.
+
+The exporter keeps **one typed lookup table (`SsaEnv`)** that maps each Pliron `Value` to a `TypedSsa { lean_name, kind }`:
+
+```text
+  Pliron `Value`       `TypedSsa { lean_name, kind }`
+  ───────────────      ────────────────────────────────────────────────────
+  `block` (arg 0)  ──► `{ lean_name: "arg0", kind: ScalarWord { width: 64 } }`
+  `a`     (arg 0)  ──► `{ lean_name: "arg0", kind: BufferParam(0) }`
+  `prod`  (op 0)   ──► `{ lean_name: "v0",   kind: ScalarWord { width: 64 } }`
+  `idx`   (op 1)   ──► `{ lean_name: "v1",   kind: Index1D { offset: 0 } }`
+  `c_len` (op 2)   ──► `{ lean_name: "v2",   kind: SliceLen(2) }`
+  `cond`  (op 3)   ──► `{ lean_name: "v3",   kind: IndexLtLen { guard_param: 2 } }`
+```
+
+Every `mir.func` goes through the same 4 steps:
+
+```text
+  1. `spec.rs`       Read function signature & optional `#[verify(...)]` attributes
+        │
+        ▼
+  2. `translate.rs`  Walk MIR instructions using `SsaEnv` (`ssa.rs`), checking
+        │            operand `SsaKind`s and recording outputs -> `TranslatedFunction`
+        ▼
+  3. `codegen.rs`    Render `TranslatedFunction` into `.lean` code + `theorem`s
+        │
+        ▼
+  4. `runner.rs`     Run `lake env lean` and verify zero `sorry`s / unexpected axioms
+```
+
+---
+
+## Module Map
+
+| File               | Job in plain English                                                 |
+|:-------------------|:---------------------------------------------------------------------|
+| `src/lib.rs`       | Parses `.mir` input and runs `translate` -> `codegen`                |
+| `src/ssa.rs`       | Defines `TypedSsa { lean_name, kind }`, `SsaKind`, and `SsaEnv`      |
+| `src/spec.rs`      | Reads `#[verify(...)]` and `#[launch_contract(...)]` on `mir.func`   |
+| `src/translate.rs` | Single MIR translator walking ops with `SsaEnv`                      |
+| `src/codegen.rs`   | Renders `TranslatedFunction` into a `.lean` file and `theorem`s      |
+| `src/runner.rs`    | Invokes `lake env lean` and audits proof axioms                      |
+
+---
+
+## Try It Out
+
+Run from the `cuda-oxide/` directory:
 
 ```sh
+# 1. Inspect the scalar arithmetic MIR demo and its generated Lean:
 cargo oxide lean-export
-cargo oxide lean-export path/to/helper.mir --function helper
+
+# 2. Inspect the verified vecadd kernel MIR and its generated Lean theorems:
+cargo oxide lean-export crates/lean-exporter/fixtures/vecadd.mir --function vecadd
+
+# 3. Run unit and mutation tests:
+cargo test -p lean-exporter
+python3 lean/check-exporter.py
 ```
-
-The first command selects the bundled demo below. The second selects a function
-in your MIR file. Inspection does not invoke Lean or verify a kernel. For raw
-Lean output only:
-
-```sh
-cargo run --quiet -p lean-exporter -- \
-  crates/lean-exporter/fixtures/arithmetic.mir global_index > /tmp/Generated.lean
-```
-
-The input is either a standalone `mir.func` or a `builtin.module` containing direct
-functions. Only the explicitly selected function is exported. The parser requires
-end-of-file. Every operation in the function is checked, including dead operations.
-Unsupported operations, semantic attributes, control flow, memory accesses, mixed
-types, and malformed SSA are errors. Pliron structural and dominance verification
-runs before output. Output uses fixed names independent of input identifiers.
-
-The fixture is **hand-authored MIR**, not a Rust kernel extraction. Its exported
-interface is `CudaOxide.Generated.program : Expr 64 3` and
-`CudaOxide.Generated.evaluate : (Fin 3 → BitVec 64) → BitVec 64`. The three inputs
-are block index, block size, and lane; the result is their modular multiply-add.
-
-The exporter is trusted translation code. Lean can check the generated expression
-and proofs about it, but that does not prove the exporter, Rust-to-MIR translation,
-GPU launch behavior, floating-point arithmetic, memory safety, or emitted PTX.
-There is no compiler build gate in this crate and it does not invoke Lean.
-
-Run `cargo test -p lean-exporter` for accepted/rejected MIR and mutation tests.
