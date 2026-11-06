@@ -341,6 +341,7 @@ cargo oxide run gemm_sol_final
 
 | Crate                     | Description                                                    |
 |---------------------------|----------------------------------------------------------------|
+| `lean-exporter`           | Experimental `dialect-mir`-to-Lean 4 exporter and proof runner |
 | `cargo-oxide`             | Cargo subcommand (`cargo oxide run`, etc.)                     |
 | `cuda-intrinsics-gen`     | Extractor and deterministic source generator for the intrinsics |
 | `cuda-artifact-finalizer` | Driver-independent NVVM IR, LTOIR, and PTX finalization         |
@@ -380,6 +381,8 @@ cargo oxide run gemm_sol_final
 **WIP:** 🚧 The **[cuda-oxide book](https://nvidia.github.io/cuda-rust/cuda-oxide/)** is the primary reference for the project. It covers SIMT kernel authoring in Rust, synchronous and asynchronous GPU programming, the compiler architecture, and more.
 
 To build and serve the book locally, see [cuda-oxide-book/README.md](cuda-oxide-book/README.md).
+
+The [Lean verification package](lean/README.md) contains the GPU access model, reusable proofs, and `#[verify(...)]` compiler workflow.
 
 ## Ecosystem
 

@@ -136,6 +136,7 @@ cuda-oxide is split into focused crates. Here is every one and its role:
 | `cuda-oxide-mlir-export` | CUTLASS 4.7 mappings and profiles; upstream MLIR printing                                     |
 | `dialect-nvvm`       | pliron dialect for NVIDIA GPU intrinsics (`tid`, `ntid`, barriers, TMA)                |
 | `mir-lower`          | Lowers `dialect-mir` to the LLVM dialect -- the main transformation pass               |
+| `lean-exporter`      | Experimental scalar MIR-to-Lean exporter                                           |
 | `cargo-oxide`        | CLI tool: `cargo oxide build`, `cargo oxide run`, `cargo oxide pipeline`               |
 | `cuda-device`        | Device-side API: intrinsics, `DisjointSlice`, barriers, shared memory, warp ops        |
 | `cute-layout`       | CuTe-style layout algebra and coordinate mapping                                       |

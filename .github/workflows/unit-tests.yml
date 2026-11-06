@@ -58,6 +58,7 @@ jobs:
           - package: cuda-intrinsics-gen
           - package: cuda-target-spec
           - package: cuda-intrinsics
+          - package: lean-exporter
           - package: llvm-export
           - package: dialect-mir
           - package: dialect-nvvm

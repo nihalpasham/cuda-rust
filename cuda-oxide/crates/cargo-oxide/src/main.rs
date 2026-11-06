@@ -18,6 +18,7 @@
 //! cargo oxide sanitize vecadd         # run under NVIDIA Compute Sanitizer
 //! cargo oxide debug vecadd --tui      # build + cuda-gdb
 //! cargo oxide inspect vecadd          # build + print generated PTX
+//! cargo oxide lean-export             # inspect the scalar MIR-to-Lean demo
 //! cargo oxide fuzz-schedule barrier   # perturb generated PTX and watchdog it
 //! cargo oxide tilelib relu --arch sm_120  # #[tile_export] crate -> cuTile tile library
 //! cargo oxide new my_kernel           # scaffold a standalone project
@@ -495,6 +496,16 @@ enum Commands {
         #[arg(long)]
         unchecked_indexing: bool,
     },
+    /// Inspect scalar MIR and its generated Lean model (source checkout only)
+    #[command(name = "lean-export")]
+    LeanExport {
+        /// MIR file to export; omit to use the bundled hand-authored demo
+        #[arg(value_name = "INPUT", requires = "function")]
+        input: Option<PathBuf>,
+        /// Exact MIR function symbol (required with a custom input)
+        #[arg(long, value_name = "NAME", requires = "input")]
+        function: Option<String>,
+    },
     /// Format all crates (SIMT workspace, codegen backend, examples)
     Fmt {
         /// Check formatting without modifying files
@@ -671,6 +682,10 @@ fn validate_materialization_cli(cli: &Cli) -> Result<(), String> {
         ),
         Commands::List { .. } => Err(
             "--materialize-cubin cannot be used with list because list does not compile device code"
+                .to_string(),
+        ),
+        Commands::LeanExport { .. } => Err(
+            "--materialize-cubin cannot be used with lean-export because it only exports a Lean model"
                 .to_string(),
         ),
         Commands::Fmt { .. } => Err(
@@ -1180,6 +1195,10 @@ fn main() {
             let ctx = commands::resolve_passive_context();
             commands::list_examples(&ctx, json);
         }
+        Commands::LeanExport { input, function } => {
+            let ctx = commands::resolve_passive_context();
+            commands::lean_export(&ctx, input.as_deref(), function.as_deref());
+        }
         Commands::Fmt { check } => {
             // Formatting compiles no device code. `format_all` reads only
             // `workspace_root`, `codegen_crate` and `examples_dir`, which the
@@ -1329,6 +1348,41 @@ mod tests {
     }
 
     #[test]
+    fn lean_export_parser_accepts_demo_and_paired_custom_input() {
+        let demo = Cli::try_parse_from(["cargo-oxide", "lean-export"]).unwrap();
+        assert!(matches!(
+            demo.command,
+            Commands::LeanExport {
+                input: None,
+                function: None
+            }
+        ));
+
+        let custom = Cli::try_parse_from([
+            "cargo-oxide",
+            "lean-export",
+            "path with spaces/input.mir",
+            "--function",
+            "global_index",
+        ])
+        .unwrap();
+        let Commands::LeanExport { input, function } = custom.command else {
+            panic!("expected LeanExport");
+        };
+        assert_eq!(input, Some(PathBuf::from("path with spaces/input.mir")));
+        assert_eq!(function.as_deref(), Some("global_index"));
+        for args in [
+            vec!["cargo-oxide", "lean-export", "input.mir"],
+            vec!["cargo-oxide", "lean-export", "--function", "global_index"],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("must require both arguments");
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
     fn update_parser_accepts_force_flag() {
         let plain =
             Cli::try_parse_from(["cargo-oxide", "update"]).expect("update command should parse");
@@ -1457,6 +1511,7 @@ mod tests {
     fn materialize_cubin_rejects_non_codegen_subcommands() {
         for args in [
             &["cargo-oxide", "fmt", "--materialize-cubin"][..],
+            &["cargo-oxide", "lean-export", "--materialize-cubin"],
             &["cargo-oxide", "new", "demo", "--materialize-cubin"],
             &["cargo-oxide", "doctor", "--materialize-cubin"],
             &["cargo-oxide", "setup", "--materialize-cubin"],
