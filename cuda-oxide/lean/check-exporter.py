@@ -108,6 +108,35 @@ def main():
             raise RuntimeError(f"Expected missing `a.len() >= c.len()` precondition to fail in Lean:\n{res_missing.stdout}")
         print("REJECTED as expected: removing `a.len() >= c.len()` breaks the `no_oob_idx(a)` proof.", flush=True)
 
+        # Mutate vecadd MIR with an off-by-one neighbor access `a[idx + 1]` under `idx < c.len()`:
+        off_by_one_mir = temporary / "vecadd_off_by_one.mir"
+        off_by_one_mir.write_text(
+            vecadd_source.replace(
+                "a_elem = mir.ptr_offset (a_ptr, idx)",
+                "one = mir.constant () [] [value: builtin.integer <1: ui64>]: <() -> (builtin.integer ui64)>;\n"
+                "    idx_plus_one = mir.add (idx, one) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;\n"
+                "    a_elem = mir.ptr_offset (a_ptr, idx_plus_one)",
+                1,
+            )
+        )
+        off_by_one_lean = require_export(off_by_one_mir, "vecadd")
+        off_by_one_file = temporary / "VecaddOffByOne.lean"
+        off_by_one_file.write_text(
+            "\n".join(line for line in off_by_one_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_oob = run_lake("env", "lean", str(off_by_one_file))
+        if res_oob.returncode == 0 or "error: omega could not prove the goal:" not in res_oob.stdout:
+            raise RuntimeError(f"Expected off-by-one `a[idx + 1]` access to fail in Lean:\n{res_oob.stdout}")
+        print("REJECTED as expected: off-by-one `a[idx + 1]` access fails the `no_oob_idx(a)` proof.", flush=True)
+
+        # Mutate vecadd MIR with an inclusive guard `mir.le (idx, c_len)` (`idx <= c.len()`):
+        inclusive_mir = temporary / "vecadd_inclusive.mir"
+        inclusive_mir.write_text(vecadd_source.replace("mir.lt (idx, c_len)", "mir.le (idx, c_len)", 1))
+        rejected_inc = export(inclusive_mir, "vecadd")
+        if rejected_inc.returncode == 0 or not rejected_inc.stderr:
+            raise RuntimeError("Expected inclusive `idx <= c.len()` guard to be rejected by exporter")
+        print("REJECTED as expected: inclusive `idx <= c.len()` guard is rejected before Lean.", flush=True)
+
     print("Exporter checks passed for both scalar and verified vecadd MIR fixtures.")
 
 

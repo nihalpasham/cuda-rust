@@ -41,7 +41,10 @@ use pliron::{
 
 use crate::{
     ExportError, check_attributes, get_attribute, reject,
-    spec::{KernelVerificationSpec, get_string_attr, has_verification_attributes, parse_kernel_verification_spec},
+    spec::{
+        KernelVerificationSpec, get_string_attr, has_verification_attributes,
+        parse_kernel_verification_spec,
+    },
     ssa::{SsaEnv, SsaKind},
 };
 
@@ -349,7 +352,7 @@ fn translate_verified_kernel(
                 }
             }
 
-                let _ = translate_kernel_block_ops(
+            let _ = translate_kernel_block_ops(
                 ctx,
                 block_idx,
                 block_ptr,
@@ -630,9 +633,10 @@ fn translate_kernel_block_ops(
                 let lhs = env.get_kind(&op.get_operand(0));
                 let rhs = env.get_kind(&op.get_operand(1));
                 let mapped = match (lhs, rhs) {
-                    (Some(SsaKind::Index1D { offset: 0 }), Some(SsaKind::SliceLen(guard_param))) => {
-                        SsaKind::IndexLtLen { guard_param }
-                    }
+                    (
+                        Some(SsaKind::Index1D { offset: 0 }),
+                        Some(SsaKind::SliceLen(guard_param)),
+                    ) => SsaKind::IndexLtLen { guard_param },
                     _ => SsaKind::DataValue,
                 };
                 env.bind_result(op.get_result(0), mapped);
@@ -640,8 +644,12 @@ fn translate_kernel_block_ops(
             "mir.not" => {
                 let inner = env.get_kind(&op.get_operand(0));
                 let mapped = match inner {
-                    Some(SsaKind::IndexLtLen { guard_param }) => SsaKind::IndexGeLen { guard_param },
-                    Some(SsaKind::IndexGeLen { guard_param }) => SsaKind::IndexLtLen { guard_param },
+                    Some(SsaKind::IndexLtLen { guard_param }) => {
+                        SsaKind::IndexGeLen { guard_param }
+                    }
+                    Some(SsaKind::IndexGeLen { guard_param }) => {
+                        SsaKind::IndexLtLen { guard_param }
+                    }
                     _ => SsaKind::DataValue,
                 };
                 env.bind_result(op.get_result(0), mapped);

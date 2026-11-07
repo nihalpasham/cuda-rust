@@ -106,10 +106,7 @@ fn parse_param_list(raw: &str, arity: usize, attr_name: &str) -> Result<Vec<usiz
     Ok(indices)
 }
 
-fn parse_requires_len_ge(
-    raw: &str,
-    arity: usize,
-) -> Result<BTreeSet<(usize, usize)>, ExportError> {
+fn parse_requires_len_ge(raw: &str, arity: usize) -> Result<BTreeSet<(usize, usize)>, ExportError> {
     let mut pairs = BTreeSet::new();
     for item in raw.split(',') {
         let item = item.trim();
@@ -169,7 +166,9 @@ pub(crate) fn parse_kernel_verification_spec(
     if domain != 1 {
         return Err(reject(
             "kernel contract",
-            format!("only 1D launch contracts (`domain = 1`) are supported in v0, found domain = {domain}"),
+            format!(
+                "only 1D launch contracts (`domain = 1`) are supported in v0, found domain = {domain}"
+            ),
         ));
     }
 
@@ -220,9 +219,7 @@ pub(crate) fn parse_kernel_verification_spec(
         } else {
             return Err(reject(
                 "kernel signature",
-                format!(
-                    "parameter {idx} must be a slice or DisjointSlice in the v0 kernel subset"
-                ),
+                format!("parameter {idx} must be a slice or DisjointSlice in the v0 kernel subset"),
             ));
         }
     }

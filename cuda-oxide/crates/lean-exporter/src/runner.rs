@@ -91,8 +91,12 @@ pub fn check_generated_lean(lean_source: &str, lean_package_dir: &Path) -> Resul
         "cuda_oxide_verified_{}_{unique}.lean",
         std::process::id()
     ));
-    fs::write(&temp_path, lean_source)
-        .map_err(|e| reject("lean verifier", format!("cannot write temporary Lean file: {e}")))?;
+    fs::write(&temp_path, lean_source).map_err(|e| {
+        reject(
+            "lean verifier",
+            format!("cannot write temporary Lean file: {e}"),
+        )
+    })?;
 
     let output = Command::new(&lake)
         .current_dir(lean_package_dir)
@@ -101,8 +105,12 @@ pub fn check_generated_lean(lean_source: &str, lean_package_dir: &Path) -> Resul
         .output();
     let _ = fs::remove_file(&temp_path);
 
-    let output = output
-        .map_err(|e| reject("lean verifier", format!("failed to execute `lake env lean`: {e}")))?;
+    let output = output.map_err(|e| {
+        reject(
+            "lean verifier",
+            format!("failed to execute `lake env lean`: {e}"),
+        )
+    })?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

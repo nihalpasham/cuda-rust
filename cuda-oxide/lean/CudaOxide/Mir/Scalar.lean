@@ -73,7 +73,7 @@ theorem mul_add_toNat_of_lt {width : Nat} (block blockSize lane : Nat)
     (hfit : block * blockSize + lane < 2 ^ width) :
     (BitVec.ofNat width block * BitVec.ofNat width blockSize +
       BitVec.ofNat width lane).toNat = block * blockSize + lane := by
-  rw [← BitVec.ofNat_mul, ← BitVec.ofNat_add]
-  exact Nat.mod_eq_of_lt hfit
+  rw [← BitVec.ofNat_mul, ← BitVec.ofNat_add]             -- Fold BitVec `*` and `+` into `BitVec.ofNat width (block * blockSize + lane)`
+  exact Nat.mod_eq_of_lt hfit                             -- `.toNat` is `% 2^width`, which is a no-op since `hfit` proves `< 2^width`
 
 end CudaOxide.Mir.Scalar

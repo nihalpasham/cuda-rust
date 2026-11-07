@@ -1461,10 +1461,7 @@ pub fn __nounroll_config() {
 /// host-checked slice-length relation as a hypothesis to Lean proofs.
 #[doc(hidden)]
 #[inline(never)]
-pub fn __launch_contract_requires_len_ge_config<
-    const LHS_PARAM: usize,
-    const RHS_PARAM: usize,
->() {
+pub fn __launch_contract_requires_len_ge_config<const LHS_PARAM: usize, const RHS_PARAM: usize>() {
     // Compiler marker: deliberately empty and removed during MIR import.
 }
 

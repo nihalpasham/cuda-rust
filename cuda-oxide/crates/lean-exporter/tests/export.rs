@@ -351,11 +351,137 @@ fn exports_verified_vecadd_kernel_and_rejects_unguarded_accesses() {
     assert!(lean.contains("theorem verify_disjoint_writes_param2"));
     assert!(lean.contains("theorem verify_writes_all_elems_param2"));
 
-    // Moving a load into the unguarded exit block must be rejected fail-closed.
-    let unguarded = VECADD_FIXTURE.replace(
+    // Scenario 4a: Moving a load into the unguarded exit block must be rejected fail-closed.
+    let unguarded_read = VECADD_FIXTURE.replace(
         "^exit():\n    mir.return",
         "^exit():\n    bad_ptr = mir.extract_field (a) [] [index: mir.field_index 0]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;\n    bad_elem = mir.ptr_offset (bad_ptr, idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;\n    bad_val = mir.load (bad_elem) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>) -> (builtin.fp32)>;\n    mir.return",
     );
-    let err = export_named_source(&unguarded, "vecadd").unwrap_err();
+    let err = export_named_source(&unguarded_read, "vecadd").unwrap_err();
     assert!(err.to_string().contains("unguarded read"));
+
+    // Scenario 4b: Moving a store into the unguarded exit block must be rejected fail-closed.
+    let unguarded_write = VECADD_FIXTURE
+        .replace("builtin.fp32", "builtin.integer ui64")
+        .replace(
+            "^exit():\n    mir.return",
+            "^exit():\n    bad_c_ptr = mir.extract_field (c) [] [index: mir.field_index 0]: <(mir.disjoint_slice <builtin.integer ui64 ,[]>) -> (mir.ptr <builtin.integer ui64 ,mutable:true,addrspace:0,kind:RawMut>)>;\n    bad_c_elem = mir.ptr_offset (bad_c_ptr, idx) [] []: <(mir.ptr <builtin.integer ui64 ,mutable:true,addrspace:0,kind:RawMut>, builtin.integer ui64) -> (mir.ptr <builtin.integer ui64 ,mutable:true,addrspace:0,kind:RawMut>)>;\n    mir.store (bad_c_elem, idx) [] []: <(mir.ptr <builtin.integer ui64 ,mutable:true,addrspace:0,kind:RawMut>, builtin.integer ui64) -> ()>;\n    mir.return",
+        );
+    let err = export_named_source(&unguarded_write, "vecadd").unwrap_err();
+    assert!(
+        err.to_string().contains("unguarded write"),
+        "unexpected error for unguarded write: {err}"
+    );
+
+    // Scenario 3: Inclusive branch guard (`idx <= c.len()` via `mir.le`) instead of `<` (`mir.lt`).
+    let inclusive_guard = VECADD_FIXTURE.replace("mir.lt (idx, c_len)", "mir.le (idx, c_len)");
+    let err = export_named_source(&inclusive_guard, "vecadd").unwrap_err();
+    assert!(
+        err.to_string().contains("unguarded read")
+            || err.to_string().contains("unsupported operation `mir.le`"),
+        "unexpected error for inclusive guard: {err}"
+    );
+
+    // Scenario 5a: Claiming `disjoint_writes` on read-only parameter 0 (`a`).
+    let bad_disjoint = VECADD_FIXTURE.replace(
+        "verify_disjoint_writes: builtin.string \"2\"",
+        "verify_disjoint_writes: builtin.string \"0\"",
+    );
+    let err = export_named_source(&bad_disjoint, "vecadd").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("parameter 0 is read-only and cannot satisfy a write obligation"),
+        "unexpected error: {err}"
+    );
+
+    // Scenario 5b: Claiming `no_oob_idx` / `disjoint_writes` on parameter 2 (`c`) when `c` is never written.
+    let unwritten_c = VECADD_FIXTURE
+        .lines()
+        .filter(|line| !line.contains("mir.store (c_elem, sum)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let err = export_named_source(&unwritten_c, "vecadd").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("parameter 2 is listed in `no_oob_idx` but never accessed"),
+        "unexpected error: {err}"
+    );
+    let unwritten_c_disjoint = unwritten_c.replace(
+        "verify_no_oob_idx: builtin.string \"0,1,2\"",
+        "verify_no_oob_idx: builtin.string \"0,1\"",
+    );
+    let err = export_named_source(&unwritten_c_disjoint, "vecadd").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("parameter 2 is listed in `disjoint_writes` but never written"),
+        "unexpected error: {err}"
+    );
+
+    // Scenario 5c: Indexing a slice by a non-thread-index value (`c_len` instead of `idx`).
+    let bad_index_expr = VECADD_FIXTURE.replace(
+        "a_elem = mir.ptr_offset (a_ptr, idx)",
+        "a_elem = mir.ptr_offset (a_ptr, c_len)",
+    );
+    let err = export_named_source(&bad_index_expr, "vecadd").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("pointer offset must index a kernel slice parameter by the 1D thread index"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn lean_typechecker_accepts_valid_vecadd_and_rejects_false_kernel_claims() {
+    let lean_dir = lean_exporter::runner::default_lean_package_dir();
+    let baseline = export_named_source(VECADD_FIXTURE, "vecadd").expect("valid vecadd MIR");
+
+    // If `lake` is not installed in a minimal container environment, skip the live
+    // Lean subprocess assertions (covered by the dedicated `lean-verification` CI job).
+    if let Err(err) = lean_exporter::runner::check_generated_lean(&baseline, &lean_dir) {
+        if err.to_string().contains("could not locate `lake`") {
+            return;
+        }
+        panic!("valid vecadd MIR must pass Lean 4 verification, got: {err}");
+    }
+
+    // Scenario 1: Missing `a.len() >= c.len()` (`0>=2` dropped from `contract_requires_len_ge`).
+    // Stage 1 exports the theorem without `h_req`, and Stage 2 (Lean `omega`) rejects it.
+    let missing_requires = VECADD_FIXTURE.replace("0>=2,1>=2", "1>=2");
+    let missing_requires_lean =
+        export_named_source(&missing_requires, "vecadd").expect("exports theorem obligation");
+    let err = lean_exporter::runner::check_generated_lean(&missing_requires_lean, &lean_dir)
+        .expect_err("Lean must reject `no_oob_idx(a)` when `a.len() >= c.len()` is missing");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing requires: {err}"
+    );
+
+    // Scenario 2: Off-by-one neighbor access `a[idx + 1]` under `if idx < c.len()`.
+    // Stage 1 extracts `indexOffset := 1`, and Stage 2 (Lean `omega`) rejects it because
+    // when `a.len() == c.len()` and `idx == c.len() - 1`, `idx + 1 == a.len()` is OOB!
+    let off_by_one = VECADD_FIXTURE.replace(
+        "a_elem = mir.ptr_offset (a_ptr, idx)",
+        "one = mir.constant () [] [value: builtin.integer <1: ui64>]: <() -> (builtin.integer ui64)>;\n    idx_plus_one = mir.add (idx, one) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;\n    a_elem = mir.ptr_offset (a_ptr, idx_plus_one)",
+    );
+    let off_by_one_lean =
+        export_named_source(&off_by_one, "vecadd").expect("exports offset=1 obligation");
+    assert!(off_by_one_lean.contains("indexOffset := 1"));
+    assert!(off_by_one_lean.contains("CudaOxide.Contracts.NoOobIdx 256 1"));
+    let err = lean_exporter::runner::check_generated_lean(&off_by_one_lean, &lean_dir)
+        .expect_err("Lean must reject off-by-one `a[idx + 1]` access");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for off-by-one access: {err}"
+    );
+
+    // Scenario 6: Admitted proof (`sorry`) must be caught by the `#print axioms` gate.
+    let spoofed_sorry = baseline.replace(
+        "exact CudaOxide.Proofs.Bounds.no_oob_idx_of_guard_le h_req",
+        "sorry",
+    );
+    let err = lean_exporter::runner::check_generated_lean(&spoofed_sorry, &lean_dir)
+        .expect_err("Lean runner must reject `sorry` proofs");
+    assert!(
+        err.to_string().contains("sorry"),
+        "unexpected error for sorry proof: {err}"
+    );
 }

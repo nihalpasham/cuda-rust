@@ -25,11 +25,7 @@ mod kernels {
         block = (256, 1, 1),
         requires = (a.len() >= c.len(), b.len() >= c.len()),
     )]
-    #[verify(
-        no_oob_idx(a, b, c),
-        disjoint_writes(c),
-        writes_all_elems(c),
-    )]
+    #[verify(no_oob_idx(a, b, c), disjoint_writes(c), writes_all_elems(c))]
     #[kernel]
     pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
         let idx = thread::index_1d();

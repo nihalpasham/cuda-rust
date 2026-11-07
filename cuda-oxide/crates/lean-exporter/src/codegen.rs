@@ -50,7 +50,9 @@ pub fn render_lean_module(translated: &TranslatedFunction) -> Result<String, Exp
 pub fn proved_obligation_descriptions(spec: &KernelVerificationSpec) -> Vec<String> {
     let mut items = Vec::new();
     for &p in &spec.no_oob_idx {
-        items.push(format!("no_oob_idx(param {p}) -> CudaOxide.Contracts.NoOobIdx"));
+        items.push(format!(
+            "no_oob_idx(param {p}) -> CudaOxide.Contracts.NoOobIdx"
+        ));
     }
     for &p in &spec.disjoint_writes {
         items.push(format!(

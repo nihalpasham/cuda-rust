@@ -279,3 +279,33 @@ jobs:
           fi
           echo "ABI history base: ${base_ref}"
           cargo run -p cuda-intrinsics-gen -- check-abi-history --base-ref "${base_ref}"
+
+  lean-verification:
+    name: Lean 4 formal verification & exporter checks
+    runs-on: linux-amd64-cpu4
+    container:
+      image: rust:1.98.0-bookworm
+    timeout-minutes: 30
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Mark the workspace as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Elan and pinned Lean 4 toolchain
+        working-directory: cuda-oxide/lean
+        run: |
+          set -euo pipefail
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lake" --version
+
+      - name: Run Lean 4 model, negative counterexamples, and exporter proof checks
+        working-directory: cuda-oxide
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          python3 lean/check.py
+          python3 lean/check-exporter.py
+          cargo test -p lean-exporter --all-targets

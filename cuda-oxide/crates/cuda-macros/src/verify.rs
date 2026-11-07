@@ -79,8 +79,7 @@ impl Parse for VerifyArgs {
             let clause: Ident = input.parse()?;
             let content;
             syn::parenthesized!(content in input);
-            let params: Punctuated<Ident, Token![,]> =
-                Punctuated::parse_terminated(&content)?;
+            let params: Punctuated<Ident, Token![,]> = Punctuated::parse_terminated(&content)?;
             if params.is_empty() {
                 return Err(syn::Error::new(
                     clause.span(),
@@ -113,10 +112,10 @@ pub(crate) fn verify_entry(attr: TokenStream, item: TokenStream) -> TokenStream 
     let args = parse_macro_input!(attr as VerifyArgs);
     let mut input = parse_macro_input!(item as ItemFn);
 
-    if let Some(params) = standalone_requires_params(&input) {
-        if let Err(error) = resolve_and_inject_verify_markers(&args, &params, &mut input) {
-            return error.to_compile_error().into();
-        }
+    if let Some(params) = standalone_requires_params(&input)
+        && let Err(error) = resolve_and_inject_verify_markers(&args, &params, &mut input)
+    {
+        return error.to_compile_error().into();
     }
 
     quote! { #input }.into()
@@ -202,11 +201,55 @@ fn resolve_verify_slice_param(
         CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } if !require_writable => Ok(index),
         CudaModuleParamMarshal::ReadOnlyDeviceBuffer { .. } => Err(syn::Error::new(
             ident.span(),
-            format!("`{clause}({ident})` requires a writable buffer (`DisjointSlice` or `&mut [T]`), but `{ident}` is read-only"),
+            format!(
+                "`{clause}({ident})` requires a writable buffer (`DisjointSlice` or `&mut [T]`), but `{ident}` is read-only"
+            ),
         )),
         CudaModuleParamMarshal::Scalar => Err(syn::Error::new(
             ident.span(),
-            format!("`{clause}({ident})` requires a slice or `DisjointSlice` parameter, found scalar `{ident}`"),
+            format!(
+                "`{clause}({ident})` requires a slice or `DisjointSlice` parameter, found scalar `{ident}`"
+            ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_rejects_unknown_clause_readonly_writes_and_scalar_params() {
+        let bad_clause = syn::parse_str::<VerifyArgs>("magic_clause(a)");
+        assert!(
+            bad_clause
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unknown #[verify] obligation `magic_clause`")
+        );
+
+        let func: ItemFn = parse_quote! {
+            pub fn vecadd(a: &[f32], n: u32, mut c: DisjointSlice<f32>) {}
+        };
+        let params = standalone_requires_params(&func).expect("params");
+
+        // `disjoint_writes(a)` on read-only slice `a: &[f32]` must be rejected.
+        let readonly_write: VerifyArgs = syn::parse_str("disjoint_writes(a)").unwrap();
+        let err = build_verify_marker_stmts(&readonly_write, &params).unwrap_err();
+        assert!(err.to_string().contains("requires a writable buffer"));
+
+        // `no_oob_idx(n)` on scalar `n: u32` must be rejected.
+        let scalar_oob: VerifyArgs = syn::parse_str("no_oob_idx(n)").unwrap();
+        let err = build_verify_marker_stmts(&scalar_oob, &params).unwrap_err();
+        assert!(err.to_string().contains("found scalar `n`"));
+
+        // `no_oob_idx(missing)` on unknown parameter must be rejected.
+        let unknown_param: VerifyArgs = syn::parse_str("no_oob_idx(missing)").unwrap();
+        let err = build_verify_marker_stmts(&unknown_param, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown kernel parameter `missing`")
+        );
     }
 }
