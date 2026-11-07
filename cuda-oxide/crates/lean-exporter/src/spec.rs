@@ -39,8 +39,12 @@ use crate::{ExportError, reject};
 /// Parsed verification and launch-contract attributes on a `mir.func`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelVerificationSpec {
-    /// Static block X dimension from `reqntid_x` (`#[launch_contract(block = (x, 1, 1))]`).
+    /// Launch domain (`1` for 1D, `2` for 2D).
+    pub domain: u32,
+    /// Static block X dimension from `reqntid_x`.
     pub block_size: u32,
+    /// Static block Y dimension from `reqntid_y` (`1` for 1D kernels).
+    pub block_y: u32,
     /// Pairs `(lhs, rhs)` from `requires = (lhs.len() >= rhs.len())`.
     pub requires_len_ge: BTreeSet<(usize, usize)>,
     /// Parameter indices requested in `#[verify(no_oob_idx(...))]`.
@@ -49,6 +53,12 @@ pub struct KernelVerificationSpec {
     pub disjoint_writes: Vec<usize>,
     /// Parameter indices requested in `#[verify(writes_all_elems(...))]`.
     pub writes_all_elems: Vec<usize>,
+    /// Static `SharedArray` indices requested in `#[verify(no_oob_idx(...))]`.
+    pub no_oob_shared: Vec<usize>,
+    /// Static `SharedArray` indices requested in `#[verify(no_data_race(...))]`.
+    pub no_data_race: Vec<usize>,
+    /// Whether `#[verify(uniform_barriers)]` was requested.
+    pub uniform_barriers: bool,
 }
 
 /// Returns true if `function` carries any `verify_*` obligation attribute.
@@ -57,7 +67,12 @@ pub fn has_verification_attributes(ctx: &Context, function: Ptr<Operation>) -> b
     attrs.0.keys().any(|key| {
         matches!(
             key.to_string().as_str(),
-            "verify_no_oob_idx" | "verify_disjoint_writes" | "verify_writes_all_elems"
+            "verify_no_oob_idx"
+                | "verify_disjoint_writes"
+                | "verify_writes_all_elems"
+                | "verify_no_oob_shared"
+                | "verify_no_data_race"
+                | "verify_uniform_barriers"
         )
     })
 }
@@ -160,14 +175,14 @@ pub(crate) fn parse_kernel_verification_spec(
     let domain = get_u32_attr(attrs, "launch_contract_domain").ok_or_else(|| {
         reject(
             "kernel contract",
-            "#[verify(...)] requires #[launch_contract(domain = 1, block = (x, 1, 1), ...)]",
+            "#[verify(...)] requires #[launch_contract(domain = ..., block = (...))]",
         )
     })?;
-    if domain != 1 {
+    if !matches!(domain, 1 | 2) {
         return Err(reject(
             "kernel contract",
             format!(
-                "only 1D launch contracts (`domain = 1`) are supported in v0, found domain = {domain}"
+                "only 1D and 2D launch contracts (`domain = 1` or `2`) are supported, found domain = {domain}"
             ),
         ));
     }
@@ -175,15 +190,21 @@ pub(crate) fn parse_kernel_verification_spec(
     let block_x = get_u32_attr(attrs, "reqntid_x").ok_or_else(|| {
         reject(
             "kernel contract",
-            "#[verify(...)] requires an exact 1D block size in #[launch_contract(block = (x, 1, 1))]",
+            "#[verify(...)] requires an exact block size in #[launch_contract(block = (x, y, 1))]",
         )
     })?;
     let block_y = get_u32_attr(attrs, "reqntid_y").unwrap_or(1);
     let block_z = get_u32_attr(attrs, "reqntid_z").unwrap_or(1);
-    if block_x == 0 || block_y != 1 || block_z != 1 {
+    if domain == 1 && (block_x == 0 || block_y != 1 || block_z != 1) {
         return Err(reject(
             "kernel contract",
             format!("expected 1D block (x > 0, 1, 1), found ({block_x}, {block_y}, {block_z})"),
+        ));
+    }
+    if domain == 2 && (block_x == 0 || block_y == 0 || block_z != 1) {
+        return Err(reject(
+            "kernel contract",
+            format!("expected 2D block (x > 0, y > 0, 1), found ({block_x}, {block_y}, {block_z})"),
         ));
     }
 
@@ -216,7 +237,7 @@ pub(crate) fn parse_kernel_verification_spec(
             }
         } else if ty_ref.downcast_ref::<MirDisjointSliceType>().is_some() {
             writable_params.insert(idx);
-        } else {
+        } else if domain == 1 {
             return Err(reject(
                 "kernel signature",
                 format!("parameter {idx} must be a slice or DisjointSlice in the v0 kernel subset"),
@@ -240,6 +261,16 @@ pub(crate) fn parse_kernel_verification_spec(
         Some(raw) => parse_param_list(&raw, arity, "verify_writes_all_elems")?,
         None => Vec::new(),
     };
+    let no_oob_shared = match get_string_attr(attrs, "verify_no_oob_shared") {
+        Some(raw) => parse_param_list(&raw, 64, "verify_no_oob_shared")?,
+        None => Vec::new(),
+    };
+    let no_data_race = match get_string_attr(attrs, "verify_no_data_race") {
+        Some(raw) => parse_param_list(&raw, 64, "verify_no_data_race")?,
+        None => Vec::new(),
+    };
+    let uniform_barriers =
+        get_string_attr(attrs, "verify_uniform_barriers").as_deref() == Some("true");
 
     for &param in disjoint_writes.iter().chain(writes_all_elems.iter()) {
         if !writable_params.contains(&param) {
@@ -253,11 +284,16 @@ pub(crate) fn parse_kernel_verification_spec(
     Ok((
         arity,
         KernelVerificationSpec {
+            domain,
             block_size: block_x,
+            block_y,
             requires_len_ge,
             no_oob_idx,
             disjoint_writes,
             writes_all_elems,
+            no_oob_shared,
+            no_data_race,
+            uniform_barriers,
         },
     ))
 }

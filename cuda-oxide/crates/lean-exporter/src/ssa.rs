@@ -27,6 +27,26 @@ use pliron::value::Value;
 
 use crate::{ExportError, reject};
 
+/// 2D shared-memory tile coordinate shape inside a `(blockDimX, blockDimY, 1)` block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TileAccessPatternKind {
+    /// Per-thread unique slot `ty * stride + tx`.
+    ThreadSlot {
+        /// Row stride of the shared tile.
+        stride: u64,
+    },
+    /// Row scan `ty * stride + i` across loop step `i`.
+    RowScan {
+        /// Row stride of the shared tile.
+        stride: u64,
+    },
+    /// Column scan `i * stride + tx` down loop step `i`.
+    ColScan {
+        /// Row stride of the shared tile.
+        stride: u64,
+    },
+}
+
 /// Semantic type and provenance of an SSA value in `dialect-mir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SsaKind {
@@ -122,6 +142,56 @@ pub enum SsaKind {
     },
     /// Boolean test `discriminant == 0` (`Option::is_none`).
     OptionIsNone,
+    /// 2D block thread index `threadIdx.x` (`0 <= tx < blockDim.x`).
+    TidX,
+    /// 2D block thread index `threadIdx.y` (`0 <= ty < blockDim.y`).
+    TidY,
+    /// Inner tile scan loop counter `i` bounded by `0 <= i < bound`.
+    LoopStep {
+        /// Exclusive upper bound on `i` from `while i < bound`.
+        bound: u64,
+    },
+    /// Stride product `ty * stride` or `i * stride` in a 2D tile coordinate.
+    TileRowScaled {
+        /// Whether the row term is `TidY` (`None`) or `LoopStep { bound }` (`Some(bound)`).
+        loop_bound: Option<u64>,
+        /// Constant row stride.
+        stride: u64,
+    },
+    /// Linear 2D shared-memory tile index (`ty * W + tx`, `ty * W + i`, or `i * W + tx`).
+    TileCoord2D {
+        /// 2D indexing pattern.
+        pattern: TileAccessPatternKind,
+        /// Exclusive upper bound on `i` (`1` for `ThreadSlot`).
+        loop_bound: u64,
+    },
+    /// Base pointer to a static `SharedArray<T, N>` allocation.
+    SharedBasePtr {
+        /// Index of the `SharedArray` static (`0`, `1`, ...).
+        shared_id: usize,
+        /// Number of elements in the `SharedArray`.
+        size: u64,
+    },
+    /// Boolean bounds test `tile_coord < size` on a `SharedArray`.
+    SharedIndexLtLen {
+        /// Constant element count compared against.
+        size: u64,
+        /// 2D indexing pattern.
+        pattern: TileAccessPatternKind,
+        /// Exclusive upper bound on `i`.
+        loop_bound: u64,
+    },
+    /// Element pointer `&TILE[tile_coord]` into a `SharedArray`.
+    SharedElementPtr {
+        /// Index of the `SharedArray` static (`0`, `1`, ...).
+        shared_id: usize,
+        /// Number of elements in the `SharedArray`.
+        size: u64,
+        /// 2D indexing pattern.
+        pattern: TileAccessPatternKind,
+        /// Exclusive upper bound on `i`.
+        loop_bound: u64,
+    },
     /// Loaded element or arithmetic value that does not affect indexing.
     DataValue,
 }

@@ -185,36 +185,43 @@ pub fn verify_module_kernels(
         let lean_code = render_lean_module(&translated)?;
         check_generated_lean(&lean_code, &lean_dir)?;
 
-        if let TranslatedFunction::Kernel {
-            spec,
-            proven_assert_ops,
-            ..
-        } = &translated
-        {
-            let elided_count = proven_assert_ops.len();
-            for &assert_op in proven_assert_ops {
-                Operation::erase(assert_op, ctx);
+        match &translated {
+            TranslatedFunction::Kernel {
+                spec,
+                proven_assert_ops,
+                ..
             }
-            let requires_list = if spec.requires_len_ge.is_empty() {
-                "none".to_string()
-            } else {
-                spec.requires_len_ge
-                    .iter()
-                    .map(|(lhs, rhs)| format!("param[{lhs}].len() >= param[{rhs}].len()"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            eprintln!(
-                "\n[lean-verifier] Verified kernel `{name}` (1D block = {}x1x1):",
-                spec.block_size
-            );
-            eprintln!("  requires:      {requires_list}");
-            for obligation in proved_obligation_descriptions(spec) {
-                eprintln!("  proved:        {obligation}");
+            | TranslatedFunction::TiledKernel2D {
+                spec,
+                proven_assert_ops,
+                ..
+            } => {
+                let elided_count = proven_assert_ops.len();
+                for &assert_op in proven_assert_ops {
+                    Operation::erase(assert_op, ctx);
+                }
+                let requires_list = if spec.requires_len_ge.is_empty() {
+                    "none".to_string()
+                } else {
+                    spec.requires_len_ge
+                        .iter()
+                        .map(|(lhs, rhs)| format!("param[{lhs}].len() >= param[{rhs}].len()"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                eprintln!(
+                    "\n[lean-verifier] Verified kernel `{name}` ({}D block = {}x{}x1):",
+                    spec.domain, spec.block_size, spec.block_y
+                );
+                eprintln!("  requires:      {requires_list}");
+                for obligation in proved_obligation_descriptions(spec) {
+                    eprintln!("  proved:        {obligation}");
+                }
+                eprintln!(
+                    "  bounds elided: {elided_count} proven `mir.assert` check(s) removed before PTX lowering"
+                );
             }
-            eprintln!(
-                "  bounds elided: {elided_count} proven `mir.assert` check(s) removed before PTX lowering"
-            );
+            TranslatedFunction::Scalar { .. } => {}
         }
     }
     Ok(())

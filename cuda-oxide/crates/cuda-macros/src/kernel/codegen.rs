@@ -48,10 +48,11 @@ pub(crate) fn generic_kernel_no_instantiation_tokens(
     if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
         return error.to_compile_error();
     }
-    let routed_verify_markers = match validate_routed_verify_attrs(&input.attrs, &entry_inputs) {
-        Ok(markers) => markers,
-        Err(error) => return error.to_compile_error(),
-    };
+    let routed_verify_markers =
+        match validate_routed_verify_attrs(&input.attrs, &entry_inputs, &mut input.block.stmts) {
+            Ok(markers) => markers,
+            Err(error) => return error.to_compile_error(),
+        };
     if !routed_verify_markers.is_empty() {
         input.block.stmts.splice(0..0, routed_verify_markers);
     }
@@ -510,10 +511,11 @@ pub(crate) fn generic_kernel_instantiation_tokens(
     if let Err(error) = validate_routed_launch_contract_requires(&input.attrs, &entry_inputs) {
         return error.to_compile_error();
     }
-    let routed_verify_markers = match validate_routed_verify_attrs(&input.attrs, &entry_inputs) {
-        Ok(markers) => markers,
-        Err(error) => return error.to_compile_error(),
-    };
+    let routed_verify_markers =
+        match validate_routed_verify_attrs(&input.attrs, &entry_inputs, &mut input.block.stmts) {
+            Ok(markers) => markers,
+            Err(error) => return error.to_compile_error(),
+        };
     if !routed_verify_markers.is_empty() {
         input.block.stmts.splice(0..0, routed_verify_markers);
     }

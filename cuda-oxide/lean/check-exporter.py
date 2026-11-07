@@ -14,6 +14,7 @@ from check import ROOT, require_success, run_lake
 REPO = ROOT.parent
 SCALAR_FIXTURE = REPO / "crates/lean-exporter/fixtures/arithmetic.mir"
 VECADD_FIXTURE = REPO / "crates/lean-exporter/fixtures/vecadd.mir"
+SGEMM_TILED_FIXTURE = REPO / "crates/lean-exporter/fixtures/sgemm_tiled.mir"
 PROOFS = """
 namespace CudaOxide.Generated
 
@@ -137,7 +138,28 @@ def main():
             raise RuntimeError("Expected inclusive `idx <= c.len()` guard to be rejected by exporter")
         print("REJECTED as expected: inclusive `idx <= c.len()` guard is rejected before Lean.", flush=True)
 
-    print("Exporter checks passed for both scalar and verified vecadd MIR fixtures.")
+        # Verified 2D phased shared-memory SGEMM checks
+        sgemm_source = SGEMM_TILED_FIXTURE.read_text()
+        sgemm_lean = require_export(SGEMM_TILED_FIXTURE, "sgemm_tiled_views")
+        sgemm_valid = temporary / "SgemmValid.lean"
+        sgemm_valid.write_text(sgemm_lean)
+        require_success("env", "lean", str(sgemm_valid))
+        print("PASS: exported 2D sgemm_tiled_views MIR proves no_oob_idx, no_data_race, and uniform_barriers.", flush=True)
+
+        # Mutate sgemm_tiled_views MIR by removing the first `nvvm.barrier0` (`sync_threads()`):
+        race_mir = temporary / "sgemm_missing_barrier.mir"
+        race_mir.write_text(sgemm_source.replace("    nvvm.barrier0 () [] []: <() -> ()>;\n", "", 1))
+        race_lean = require_export(race_mir, "sgemm_tiled_views")
+        race_file = temporary / "SgemmRace.lean"
+        race_file.write_text(
+            "\n".join(line for line in race_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_race = run_lake("env", "lean", str(race_file))
+        if res_race.returncode == 0 or "error: omega could not prove the goal:" not in res_race.stdout:
+            raise RuntimeError(f"Expected missing `sync_threads()` to fail NoDataRace in Lean:\n{res_race.stdout}")
+        print("REJECTED as expected: missing `sync_threads()` between write and read fails `no_data_race`.", flush=True)
+
+    print("Exporter checks passed for scalar, 1D vecadd, and 2D phased shared-memory SGEMM fixtures.")
 
 
 if __name__ == "__main__":

@@ -1489,6 +1489,30 @@ pub fn __verify_writes_all_elems_config<const PARAM: usize>() {
     // Compiler marker: deliberately empty and removed during MIR import.
 }
 
+/// Internal compiler marker recording a `no_oob_idx(SHARED)` obligation on a
+/// static `SharedArray` item from `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_no_oob_shared_config<const SHARED_IDX: usize>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Internal compiler marker recording a `no_data_race(SHARED)` obligation on a
+/// static `SharedArray` item from `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_no_data_race_config<const SHARED_IDX: usize>() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
+/// Internal compiler marker recording a `uniform_barriers` obligation from
+/// `#[verify(...)]`.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __verify_uniform_barriers_config() {
+    // Compiler marker: deliberately empty and removed during MIR import.
+}
+
 #[cfg(test)]
 mod tests {
     use super::block_linear_thread_id;

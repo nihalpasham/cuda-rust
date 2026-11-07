@@ -47,6 +47,12 @@ pub(crate) const VERIFICATION_METADATA_MARKERS: &[&str] = &[
     "cuda_device::thread::__verify_disjoint_writes_config",
     "cuda_device::__verify_writes_all_elems_config",
     "cuda_device::thread::__verify_writes_all_elems_config",
+    "cuda_device::__verify_no_oob_shared_config",
+    "cuda_device::thread::__verify_no_oob_shared_config",
+    "cuda_device::__verify_no_data_race_config",
+    "cuda_device::thread::__verify_no_data_race_config",
+    "cuda_device::__verify_uniform_barriers_config",
+    "cuda_device::thread::__verify_uniform_barriers_config",
 ];
 
 /// Map a callee path to its canonical marker leaf name when it is a
@@ -67,6 +73,14 @@ pub(crate) fn verification_marker_leaf(path: &str) -> Option<&'static str> {
         | "cuda_device::thread::__verify_writes_all_elems_config" => {
             "__verify_writes_all_elems_config"
         }
+        "cuda_device::__verify_no_oob_shared_config"
+        | "cuda_device::thread::__verify_no_oob_shared_config" => "__verify_no_oob_shared_config",
+        "cuda_device::__verify_no_data_race_config"
+        | "cuda_device::thread::__verify_no_data_race_config" => "__verify_no_data_race_config",
+        "cuda_device::__verify_uniform_barriers_config"
+        | "cuda_device::thread::__verify_uniform_barriers_config" => {
+            "__verify_uniform_barriers_config"
+        }
         _ => return None,
     })
 }
@@ -85,6 +99,12 @@ struct DetectedVerificationMetadata {
     disjoint_writes: Vec<usize>,
     /// Parameter indices requested in `#[verify(writes_all_elems(...))]`.
     writes_all_elems: Vec<usize>,
+    /// Static `SharedArray` indices requested in `#[verify(no_oob_idx(...))]`.
+    no_oob_shared: Vec<usize>,
+    /// Static `SharedArray` indices requested in `#[verify(no_data_race(...))]`.
+    no_data_race: Vec<usize>,
+    /// Whether `#[verify(uniform_barriers)]` was requested.
+    uniform_barriers: bool,
 }
 
 impl DetectedVerificationMetadata {
@@ -93,6 +113,9 @@ impl DetectedVerificationMetadata {
         !self.no_oob_idx.is_empty()
             || !self.disjoint_writes.is_empty()
             || !self.writes_all_elems.is_empty()
+            || !self.no_oob_shared.is_empty()
+            || !self.no_data_race.is_empty()
+            || self.uniform_barriers
     }
 }
 
@@ -169,6 +192,22 @@ fn detect_verification_metadata(
             && !meta.writes_all_elems.contains(&param)
         {
             meta.writes_all_elems.push(param);
+        } else if (fn_name == "__verify_no_oob_shared_config"
+            || fn_name.ends_with("::__verify_no_oob_shared_config"))
+            && let Some(shared_idx) = args.0.first().and_then(read_const_usize_arg)
+            && !meta.no_oob_shared.contains(&shared_idx)
+        {
+            meta.no_oob_shared.push(shared_idx);
+        } else if (fn_name == "__verify_no_data_race_config"
+            || fn_name.ends_with("::__verify_no_data_race_config"))
+            && let Some(shared_idx) = args.0.first().and_then(read_const_usize_arg)
+            && !meta.no_data_race.contains(&shared_idx)
+        {
+            meta.no_data_race.push(shared_idx);
+        } else if fn_name == "__verify_uniform_barriers_config"
+            || fn_name.ends_with("::__verify_uniform_barriers_config")
+        {
+            meta.uniform_barriers = true;
         }
     }
     meta
@@ -215,6 +254,8 @@ pub(crate) fn attach_verification_attributes(
                 "verify_writes_all_elems",
                 &verification_meta.writes_all_elems,
             ),
+            ("verify_no_oob_shared", &verification_meta.no_oob_shared),
+            ("verify_no_data_race", &verification_meta.no_data_race),
         ] {
             if !indices.is_empty() {
                 let formatted = indices
@@ -225,6 +266,10 @@ pub(crate) fn attach_verification_attributes(
                 let key: Identifier = attr_name.try_into().unwrap();
                 op_mut.attributes.set(key, StringAttr::new(formatted));
             }
+        }
+        if verification_meta.uniform_barriers {
+            let key: Identifier = "verify_uniform_barriers".try_into().unwrap();
+            op_mut.attributes.set(key, StringAttr::new("true".into()));
         }
     }
 }

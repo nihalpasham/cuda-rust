@@ -20,6 +20,7 @@ use pliron::{
 
 const FIXTURE: &str = include_str!("../fixtures/arithmetic.mir");
 const VECADD_FIXTURE: &str = include_str!("../fixtures/vecadd.mir");
+const SGEMM_TILED_FIXTURE: &str = include_str!("../fixtures/sgemm_tiled.mir");
 
 fn export(source: &str) -> String {
     export_named_source(source, "global_index").expect("valid scalar MIR")
@@ -483,5 +484,81 @@ fn lean_typechecker_accepts_valid_vecadd_and_rejects_false_kernel_claims() {
     assert!(
         err.to_string().contains("sorry"),
         "unexpected error for sorry proof: {err}"
+    );
+}
+
+#[test]
+fn verifies_2d_sgemm_tiled_views_and_rejects_shared_races_oob_and_divergent_barriers() {
+    let lean_dir = lean_exporter::runner::default_lean_package_dir();
+    let baseline = export_named_source(SGEMM_TILED_FIXTURE, "sgemm_tiled_views")
+        .expect("valid sgemm_tiled_views MIR");
+    assert!(baseline.contains("def kernelSummary : CudaOxide.Mir.Kernel.TiledKernelSummary2D"));
+    assert!(baseline.contains("theorem verify_no_oob_idx_shared0_0"));
+    assert!(baseline.contains("theorem verify_no_data_race_shared0_0_1"));
+    assert!(baseline.contains("theorem verify_uniform_barriers"));
+
+    // Stage 1 negative check: indexing SharedArray by a non-2D-tile expression (`k` instead of `smem_idx`).
+    let bad_shared_offset = SGEMM_TILED_FIXTURE.replace(
+        "slot_a = mir.ptr_offset (tile_a_mut, smem_idx)",
+        "k_u64 = mir.cast (k) [] [cast_kind: mir.cast_kind IntToInt]: <(builtin.integer ui32) -> (builtin.integer ui64)>;\n    slot_a = mir.ptr_offset (tile_a_mut, k_u64)",
+    );
+    let err = export_named_source(&bad_shared_offset, "sgemm_tiled_views").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("shared memory pointer offset must use a recognized 2D tile coordinate"),
+        "unexpected error: {err}"
+    );
+
+    if let Err(err) = lean_exporter::runner::check_generated_lean(&baseline, &lean_dir) {
+        if err.to_string().contains("could not locate `lake`") {
+            return;
+        }
+        panic!("valid sgemm_tiled_views MIR must pass Lean 4 verification, got: {err}");
+    }
+
+    // Stage 2 Negative Scenario A: Missing first `sync_threads()` (`nvvm.barrier0`) between
+    // Phase 0 writes (`TILE_A[ty * 16 + tx]`) and Phase 1 reads (`TILE_A[ty * 16 + i]`).
+    // Both accesses land in Phase 0, and Lean 4 rejects `NoDataRace` with a counterexample!
+    let missing_barrier =
+        SGEMM_TILED_FIXTURE.replacen("    nvvm.barrier0 () [] []: <() -> ()>;\n", "", 1);
+    let missing_barrier_lean = export_named_source(&missing_barrier, "sgemm_tiled_views")
+        .expect("exports phase-collapsed obligation");
+    let err = lean_exporter::runner::check_generated_lean(&missing_barrier_lean, &lean_dir)
+        .expect_err("Lean must reject missing `sync_threads()` shared-memory data race");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing sync_threads: {err}"
+    );
+
+    // Stage 2 Negative Scenario B: Shrinking `TILE_A` from 256 to 128 elements under a 16x16 block.
+    // Lean 4 rejects `NoOobTileAccess` because `ty * 16 + tx` can reach 255 >= 128.
+    let small_tile = SGEMM_TILED_FIXTURE.replacen(
+        "size: builtin.integer <256: i64>",
+        "size: builtin.integer <128: i64>",
+        1,
+    );
+    let small_tile_lean =
+        export_named_source(&small_tile, "sgemm_tiled_views").expect("exports OOB tile obligation");
+    let err = lean_exporter::runner::check_generated_lean(&small_tile_lean, &lean_dir)
+        .expect_err("Lean must reject undersized SharedArray<f32, 128> for 16x16 block");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for undersized shared tile: {err}"
+    );
+
+    // Stage 2 Negative Scenario C: Non-uniform / divergent barrier (early conditional return
+    // before the barrier loop). Lean 4 rejects `UniformBarriers false ...`.
+    let divergent_barrier = SGEMM_TILED_FIXTURE.replace(
+        "mir.goto (zero_f32, zero_u32) [^tile_header] []: <(builtin.fp32, builtin.integer ui32) -> ()>",
+        "early_cond = mir.lt (tx, k) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer i1)>;\n    mir.cond_br (early_cond) [^exit, ^enter_loop] [builtin_operand_segment_sizes: builtin.operand_segment_sizes [1, 0, 0]]: <(builtin.integer i1) -> ()>\n\n  ^enter_loop():\n    mir.goto (zero_f32, zero_u32) [^tile_header] []: <(builtin.fp32, builtin.integer ui32) -> ()>",
+    );
+    let divergent_lean = export_named_source(&divergent_barrier, "sgemm_tiled_views")
+        .expect("exports UniformBarriers false obligation");
+    assert!(divergent_lean.contains("barriersUniform := false"));
+    let err = lean_exporter::runner::check_generated_lean(&divergent_lean, &lean_dir)
+        .expect_err("Lean must reject divergent barrier when early return skips barrier loop");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for divergent barrier: {err}"
     );
 }

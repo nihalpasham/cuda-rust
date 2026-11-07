@@ -58,4 +58,59 @@ def GuardedAccess1D.address {arity : Nat}
     (access : GuardedAccess1D arity) (blockSize block lane : Nat) : Nat :=
   CudaOxide.Mir.globalIndex blockSize block lane + access.indexOffset
 
+/-- Memory address space of a buffer access. -/
+inductive MemorySpace where
+  /-- Global device memory (`&[T]`, `DisjointSlice`). -/
+  | global
+  /-- Per-block shared memory (`SharedArray<T, N>`). -/
+  | shared
+  deriving Repr, DecidableEq
+
+/-- 2D shared-memory tile indexing pattern inside a `(blockDimX, blockDimY, 1)` block. -/
+inductive TileAccessPattern where
+  /-- Unique per-thread staging slot `ty * stride + tx`. -/
+  | threadSlot (stride : Nat)
+  /-- Row scan `ty * stride + i` across loop index `i`. -/
+  | rowScan (stride : Nat)
+  /-- Column scan `i * stride + tx` down loop index `i`. -/
+  | colScan (stride : Nat)
+  deriving Repr, DecidableEq
+
+/-- Evaluate the flat element index of a 2D tile access for thread `(tx, ty)` at step `i`. -/
+def TileAccessPattern.address (pat : TileAccessPattern) (tx ty i : Nat) : Nat :=
+  match pat with
+  | .threadSlot stride => CudaOxide.Mir.globalIndex stride ty tx
+  | .rowScan stride => CudaOxide.Mir.globalIndex stride ty i
+  | .colScan stride => CudaOxide.Mir.globalIndex stride i tx
+
+/-- A shared-memory tile access tagged with its barrier phase (`0`, `1`, ...). -/
+structure PhasedTileAccess where
+  /-- Read or write access. -/
+  kind : AccessKind
+  /-- Memory space (`.shared` for `SharedArray`). -/
+  space : MemorySpace := .shared
+  /-- Identifier of the target buffer (`0` for `TILE_A`, `1` for `TILE_B`, ...). -/
+  bufferId : Nat
+  /-- Barrier phase index (`0` before first `sync_threads()`, `1` after first, etc.). -/
+  phase : Nat
+  /-- 2D coordinate formula used to index the buffer. -/
+  pattern : TileAccessPattern
+  /-- Exclusive upper bound on loop index `i` (`1` if not inside an inner scan loop). -/
+  loopBound : Nat := 1
+  deriving Repr, DecidableEq
+
+/-- Summary of a 2D phased shared-memory kernel extracted at `PostMem2Reg`. -/
+structure TiledKernelSummary2D where
+  /-- Static X dimension of the thread block (`reqntid_x`). -/
+  blockDimX : Nat
+  /-- Static Y dimension of the thread block (`reqntid_y`). -/
+  blockDimY : Nat
+  /-- Number of `sync_threads()` barriers in the tile loop. -/
+  numBarriers : Nat
+  /-- Whether all barriers execute in thread-uniform control flow. -/
+  barriersUniform : Bool
+  /-- All phased shared-memory accesses extracted from the kernel CFG. -/
+  sharedAccesses : List PhasedTileAccess
+  deriving Repr, DecidableEq
+
 end CudaOxide.Mir.Kernel

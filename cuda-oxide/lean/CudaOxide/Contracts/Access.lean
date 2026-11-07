@@ -4,6 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -/
 
 import CudaOxide.Mir.Launch
+import CudaOxide.Mir.Kernel
 
 /-!
 # Kernel Verification Contracts (`CudaOxide.Contracts`)
@@ -14,9 +15,11 @@ by a kernel author in Rust's `#[verify(...)]` attribute:
 ```text
   Rust `#[verify(...)]` Clause           Lean Proposition (`CudaOxide.Contracts`)
   ──────────────────────────────────     ──────────────────────────────────────────
-  `no_oob_idx(buf)`                      `NoOobIdx blockSize offset guardLen bufLen`
+  `no_oob_idx(buf)`                      `NoOobIdx` / `NoOobTileAccess`
   `disjoint_writes(buf)`                 `DisjointWrites blockSize offset`
   `writes_all_elems(buf)`                `WritesAllElems blocks blockSize outLen`
+  `no_data_race(buf)`                    `NoDataRace blockDimX blockDimY a₁ a₂`
+  `uniform_barriers`                     `UniformBarriers barriersUniform numBarriers`
 ```
 
 Each proposition states a mathematical obligation over the kernel's exported
@@ -24,6 +27,7 @@ Each proposition states a mathematical obligation over the kernel's exported
 -/
 namespace CudaOxide.Contracts
 open CudaOxide.Mir
+open CudaOxide.Mir.Kernel
 
 /-- **`no_oob_idx(buf)`**: Every thread `(block, lane)` that passes the strict
     guard `globalIndex blockSize block lane < guardLen` indexes `buf` at
@@ -52,5 +56,56 @@ def WritesAllElems (blocks blockSize outLen : Nat) : Prop :=
       block < blocks ∧                                    --   1. `block` is a valid launched block, AND
       lane < blockSize ∧                                  --   2. `lane` is a valid lane in that block, AND
       globalIndex blockSize block lane = i                --   3. that thread's global index equals `i`.
+
+/-- **`no_oob_idx(TILE)`**: Every 2D thread `(tx, ty)` and loop step `i < loopBound`
+    indexes `TILE` strictly below `bufferLen`. -/
+def NoOobTileAccess (blockDimX blockDimY loopBound : Nat)
+    (pat : TileAccessPattern) (bufferLen : Nat) : Prop :=
+  ∀ tx ty i : Nat,                                        -- Pick ANY 2D thread (tx, ty) and loop step `i`:
+    tx < blockDimX →                                      -- IF `tx` is within the block X dimension,
+    ty < blockDimY →                                      -- AND `ty` is within the block Y dimension,
+    i < loopBound →                                       -- AND `i` is within the loop bound,
+    pat.address tx ty i < bufferLen                       -- THEN the tile index is strictly `< bufferLen`.
+
+/-- **`no_data_race(buf)`**: Two accesses `a₁` and `a₂` on the same buffer never
+    cause a write-write or read-write conflict between distinct threads in the
+    same barrier phase. -/
+def NoDataRace (blockDimX blockDimY : Nat)
+    (a₁ a₂ : PhasedTileAccess) : Prop :=
+  ∀ tx₁ ty₁ i₁ tx₂ ty₂ i₂ : Nat,                            -- Pick ANY two threads (tx₁, ty₁), (tx₂, ty₂) and steps i₁, i₂:
+    tx₁ < blockDimX → ty₁ < blockDimY → i₁ < a₁.loopBound → -- IF thread 1 and step i₁ are within bounds,
+    tx₂ < blockDimX → ty₂ < blockDimY → i₂ < a₂.loopBound → -- AND thread 2 and step i₂ are within bounds,
+    a₁.bufferId = a₂.bufferId →                             -- AND both accesses target the same buffer,
+    a₁.phase = a₂.phase →                                   -- AND both accesses execute in the SAME barrier phase,
+    (a₁.kind = .write ∨ a₂.kind = .write) →                 -- AND at least one of the accesses is a write,
+    a₁.pattern.address tx₁ ty₁ i₁ =                         -- AND both threads compute the exact same
+      a₂.pattern.address tx₂ ty₂ i₂ →                       --     element address in that buffer,
+    tx₁ = tx₂ ∧ ty₁ = ty₂                                   -- THEN they must be the exact same thread (`∧` = AND).
+
+/-- **`uniform_barriers`**: All `sync_threads()` barriers in the kernel execute
+    in thread-uniform control flow. -/
+def UniformBarriers (barriersUniform : Bool) (numBarriers : Nat) : Prop :=
+  barriersUniform = true ∧                                -- Every barrier is outside thread-divergent branches, AND
+  0 < numBarriers                                         -- at least one barrier synchronizes the phases.
+
+/-- **`no_oob_idx(a)` (2D row strip)**: Every element `start + col` with
+    `col < cols` is `< bufferLen` when the strip's last element
+    `start + (cols - 1) < bufferLen`. -/
+def NoOobRowStrip (bufferLen : Nat) : Prop :=
+  ∀ start cols col : Nat,                                 -- Pick ANY row strip start, width `cols`, and offset `col`:
+    0 < cols →                                            -- IF the strip is non-empty (`cols > 0`),
+    start + (cols - 1) < bufferLen →                      -- AND the strip's last element fits in `bufferLen`,
+    col < cols →                                          -- AND the thread's column offset `col < cols`,
+    start + col < bufferLen                               -- THEN `start + col` is strictly `< bufferLen`.
+
+/-- **`no_oob_idx(b)` (2D column strip)**: Every strided element
+    `start + row * stride` with `row < rows` is `< bufferLen` when the
+    strip's last element `(rows - 1) * stride + start < bufferLen`. -/
+def NoOobColStrip (bufferLen : Nat) : Prop :=
+  ∀ start stride rows row : Nat,                          -- Pick ANY col strip start, row stride, height `rows`, and `row`:
+    0 < rows →                                            -- IF the strip is non-empty (`rows > 0`),
+    (rows - 1) * stride + start < bufferLen →             -- AND the strip's last strided element fits in `bufferLen`,
+    row < rows →                                          -- AND the thread's row offset `row < rows`,
+    start + row * stride < bufferLen                      -- THEN `start + row * stride` is strictly `< bufferLen`.
 
 end CudaOxide.Contracts

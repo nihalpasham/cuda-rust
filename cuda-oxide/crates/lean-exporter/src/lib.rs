@@ -119,6 +119,7 @@ pub(crate) fn symbol_name(ctx: &Context, op: Ptr<Operation>) -> Result<String, E
 pub fn export_named_source(source: &str, name: &str) -> Result<String, ExportError> {
     let mut ctx = Context::new();
     dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
     let headers = skip_many(attempt(
         spaces()
             .with(string("//"))
