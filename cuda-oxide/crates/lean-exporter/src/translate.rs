@@ -1273,6 +1273,15 @@ fn translate_verified_2d_tiled_kernel(
                                 pattern,
                                 loop_bound,
                             },
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: size, .. })) => {
+                                SsaKind::SharedIndexLtLen {
+                                    size: u64::try_from(size).unwrap_or(u64::MAX),
+                                    pattern: TileAccessPatternKind::ThreadSlot {
+                                        stride: u64::from(spec.block_size),
+                                    },
+                                    loop_bound: 1,
+                                }
+                            }
                             (_, Some(SsaKind::SliceLen(guard_param))) => {
                                 SsaKind::IndexLtLen { guard_param }
                             }
@@ -1289,7 +1298,7 @@ fn translate_verified_2d_tiled_kernel(
                                 pattern,
                                 loop_bound,
                             }),
-                        ) = (base, idx)
+                        ) = (base.clone(), idx.clone())
                         {
                             update(
                                 &mut env,
@@ -1299,6 +1308,23 @@ fn translate_verified_2d_tiled_kernel(
                                     size,
                                     pattern,
                                     loop_bound,
+                                },
+                            );
+                        } else if let (
+                            Some(SsaKind::SharedBasePtr { shared_id, size }),
+                            Some(SsaKind::TidX),
+                        ) = (base, idx)
+                        {
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::SharedElementPtr {
+                                    shared_id,
+                                    size,
+                                    pattern: TileAccessPatternKind::ThreadSlot {
+                                        stride: u64::from(spec.block_size),
+                                    },
+                                    loop_bound: 1,
                                 },
                             );
                         } else if op.get_num_results() == 1 {

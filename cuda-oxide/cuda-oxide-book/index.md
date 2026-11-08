@@ -150,6 +150,7 @@ gpu-programming/error-handling-and-debugging
 
 gpu-safety/the-safety-model
 gpu-safety/bounds-checks
+gpu-safety/verified-kernels
 ```
 
 ```{toctree}

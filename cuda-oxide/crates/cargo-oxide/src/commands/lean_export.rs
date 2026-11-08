@@ -5,18 +5,64 @@
 
 use std::{
     ffi::OsStr,
+    fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use crate::{backend, backend_source};
 
-use super::Context;
+use super::{Context, context::example_roots};
 
 const DEMO_INPUT: &str = "crates/lean-exporter/fixtures/arithmetic.mir";
 const DEMO_FUNCTION: &str = "global_index";
 const DEMO_NOTICE: &str = "Demo: hand-authored scalar MIR, not extracted from a Rust kernel.\n\n";
+
+fn resolve_verified_example_functions(
+    ctx: &Context,
+    workspace: &Path,
+    example_name: &str,
+    explicit_fn: Option<&str>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let roots = example_roots(ctx);
+    let matches: Vec<_> = roots
+        .iter()
+        .map(|root| root.join(example_name))
+        .filter(|path| path.is_dir())
+        .collect();
+    let example_dir = match matches.as_slice() {
+        [dir] => dir.clone(),
+        [] => return Err("custom input and --function must be supplied together".into()),
+        _ => return Err(format!("example name is ambiguous: {example_name}")),
+    };
+
+    let main_rs = example_dir.join("src/main.rs");
+    let source = fs::read_to_string(&main_rs).unwrap_or_default();
+    if !source.contains("#[verify(") {
+        return Err(format!(
+            "example `{example_name}` does not use `#[verify(...)]`; only verified examples can be exported with `cargo oxide lean-export <example>`"
+        ));
+    }
+
+    let (fixture_rel, default_fns): (&str, &[&str]) = match example_name {
+        "verified_vecadd" => ("crates/lean-exporter/fixtures/vecadd.mir", &["vecadd"]),
+        "verified_gemm_views" => (
+            "crates/lean-exporter/fixtures/sgemm_tiled.mir",
+            &["sgemm_tiled_views", "sgemm_tiled_raw"],
+        ),
+        _ => {
+            return Err(format!(
+                "no PostMem2Reg MIR fixture registered for verified example `{example_name}`"
+            ));
+        }
+    };
+    let fns = match explicit_fn {
+        Some(f) => vec![f.to_string()],
+        None => default_fns.iter().map(|s| (*s).to_string()).collect(),
+    };
+    Ok((workspace.join(fixture_rel), fns))
+}
 
 /// Display input MIR and the generated scalar Lean model without building the
 /// device compiler, loading CUDA, or running Lean. The exporter remains a
@@ -26,14 +72,21 @@ pub fn lean_export(ctx: &Context, input: Option<&Path>, function: Option<&str>) 
         .map_err(|error| format!("cannot determine current directory: {error}"))
         .and_then(|invocation_dir| {
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut command = exporter_command(ctx, &invocation_dir, input, function, &cargo)?;
-            let output = command
-                .output()
-                .map_err(|error| format!("could not start the scalar MIR exporter: {error}"))?;
-            let output = inspection_output(output, input.is_none())?;
+            let commands = exporter_commands(ctx, &invocation_dir, input, function, &cargo)?;
+            let mut combined = String::new();
+            for mut command in commands {
+                let output = command
+                    .output()
+                    .map_err(|error| format!("could not start the scalar MIR exporter: {error}"))?;
+                let rendered = inspection_output(output, input.is_none())?;
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&rendered);
+            }
             io::stdout()
                 .lock()
-                .write_all(output.as_bytes())
+                .write_all(combined.as_bytes())
                 .map_err(|error| format!("cannot write inspection output: {error}"))
         });
     if let Err(error) = result {
@@ -42,13 +95,13 @@ pub fn lean_export(ctx: &Context, input: Option<&Path>, function: Option<&str>) 
     }
 }
 
-fn exporter_command(
+fn exporter_commands(
     ctx: &Context,
     invocation_dir: &Path,
     input: Option<&Path>,
     function: Option<&str>,
     cargo: &OsStr,
-) -> Result<Command, String> {
+) -> Result<Vec<Command>, String> {
     let exporter = backend::simt_crate_path(&ctx.workspace_root, "lean-exporter");
     if !ctx.is_workspace || !exporter.join("Cargo.toml").is_file() {
         return Err("`cargo oxide lean-export` must be run inside a cuda-oxide source checkout containing crates/lean-exporter".into());
@@ -57,32 +110,70 @@ fn exporter_command(
         .parent()
         .and_then(Path::parent)
         .ok_or("cannot locate the CUDA Oxide workspace for lean-exporter")?;
-    let (input, function) = match (input, function) {
-        (None, None) => (workspace.join(DEMO_INPUT), DEMO_FUNCTION),
+    let (input_path, functions): (PathBuf, Vec<String>) = match (input, function) {
+        (None, None) => (workspace.join(DEMO_INPUT), vec![DEMO_FUNCTION.to_string()]),
         (Some(path), Some(function)) => {
-            let absolute = if path.is_absolute() {
-                path.to_owned()
+            if path.extension().and_then(|e| e.to_str()) != Some("mir")
+                && let Some(name) = path.to_str()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && let Ok(resolved) =
+                    resolve_verified_example_functions(ctx, workspace, name, Some(function))
+            {
+                resolved
             } else {
-                invocation_dir.join(path)
-            };
-            (absolute, function)
+                let absolute = if path.is_absolute() {
+                    path.to_owned()
+                } else {
+                    invocation_dir.join(path)
+                };
+                (absolute, vec![function.to_string()])
+            }
         }
-        _ => return Err("custom input and --function must be supplied together".into()),
+        (Some(path), None) => {
+            if let Some(name) = path.to_str()
+                && path.extension().and_then(|e| e.to_str()) != Some("mir")
+                && !name.contains('/')
+                && !name.contains('\\')
+            {
+                resolve_verified_example_functions(ctx, workspace, name, None)?
+            } else {
+                return Err("custom input and --function must be supplied together".into());
+            }
+        }
+        (None, Some(_)) => {
+            return Err("custom input and --function must be supplied together".into());
+        }
     };
-    let mut command = Command::new(cargo);
-    // A root-level Cargo invocation can pass the stable host toolchain through
-    // RUSTUP_TOOLCHAIN. This source tool belongs to the nested SIMT workspace.
-    if let Some(channel) = backend_source::pinned_channel(workspace) {
-        command.env("RUSTUP_TOOLCHAIN", channel);
+    let mut commands = Vec::new();
+    for fn_name in functions {
+        let mut command = Command::new(cargo);
+        // A root-level Cargo invocation can pass the stable host toolchain through
+        // RUSTUP_TOOLCHAIN. This source tool belongs to the nested SIMT workspace.
+        if let Some(channel) = backend_source::pinned_channel(workspace) {
+            command.env("RUSTUP_TOOLCHAIN", channel);
+        }
+        command
+            .current_dir(workspace)
+            .args(["run", "--quiet", "--manifest-path"])
+            .arg(workspace.join("Cargo.toml"))
+            .args(["-p", "lean-exporter", "--", "--inspect"])
+            .arg(&input_path)
+            .arg(fn_name);
+        commands.push(command);
     }
-    command
-        .current_dir(workspace)
-        .args(["run", "--quiet", "--manifest-path"])
-        .arg(workspace.join("Cargo.toml"))
-        .args(["-p", "lean-exporter", "--", "--inspect"])
-        .arg(input)
-        .arg(function);
-    Ok(command)
+    Ok(commands)
+}
+
+#[cfg(test)]
+fn exporter_command(
+    ctx: &Context,
+    invocation_dir: &Path,
+    input: Option<&Path>,
+    function: Option<&str>,
+    cargo: &OsStr,
+) -> Result<Command, String> {
+    exporter_commands(ctx, invocation_dir, input, function, cargo).map(|mut cmds| cmds.remove(0))
 }
 
 fn inspection_output(output: Output, is_demo: bool) -> Result<String, String> {

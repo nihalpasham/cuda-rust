@@ -18,54 +18,60 @@ namespace CudaOxide.Proofs.Bounds
 open CudaOxide.Contracts
 open CudaOxide.Mir.Kernel
 
-/-- A strict branch guard `i < guardLen` implies `i < bufferLen` whenever the
-    launch contract establishes `guardLen ≤ bufferLen`. -/
+/-- If `i < guardLen` (from an `if` check) and `guardLen ≤ bufferLen` (from
+    `requires`), then `i < bufferLen`. -/
 theorem index_lt_of_guard {i guardLen bufferLen : Nat}
     (active : i < guardLen) (fits : guardLen ≤ bufferLen) : i < bufferLen := by
   exact Nat.lt_of_lt_of_le active fits                    -- Chain `i < guardLen` and `guardLen ≤ bufferLen`
 
-/-- Discharges `NoOobIdx` for an unshifted 1D access (`buf[idx]`) when the
-    launch contract requires `guardLen ≤ bufferLen`. -/
+/-- Proves `no_oob_idx(buf)` for `buf[idx]` when the kernel checks `if idx < guardLen`
+    and the launch contract guarantees `guardLen ≤ bufferLen` (e.g., `c.len() ≤ a.len()`). -/
 theorem no_oob_idx_of_guard_le {blockSize guardLen bufferLen : Nat}
     (fits : guardLen ≤ bufferLen) :
     NoOobIdx blockSize 0 guardLen bufferLen := by
   intro block lane active                                 -- Unpack `∀ block lane` and guard `active : idx < guardLen`
   simpa using index_lt_of_guard active fits               -- Simplify `idx + 0` to `idx` and apply `index_lt_of_guard`
 
-/-- Discharges `NoOobIdx` when a buffer's own length is the branch guard
-    (`idx < buf.len()`). -/
+/-- Proves `no_oob_idx(buf)` for `buf[idx]` when the kernel checks `buf`'s own
+    length directly (`if idx < buf.len()`). -/
 theorem no_oob_idx_of_same_len {blockSize bufferLen : Nat} :
     NoOobIdx blockSize 0 bufferLen bufferLen := by
   exact no_oob_idx_of_guard_le (Nat.le_refl bufferLen)    -- Special case where `bufferLen ≤ bufferLen` by reflexivity
 
-/-- Discharges `NoOobTileAccess` for a per-thread 2D slot (`ty * W + tx < bufLen`). -/
+/-- Proves `no_oob_idx(TILE)` for `TILE[ty * W + tx]`: in-bounds when `tx < W`,
+    `ty < H`, and the `H * W` block fits inside `bufferLen`. -/
 theorem no_oob_tile_slot {blockDimX blockDimY loopBound bufferLen : Nat}
     (hfit : blockDimY * blockDimX ≤ bufferLen) :
     NoOobTileAccess blockDimX blockDimY loopBound (.threadSlot blockDimX) bufferLen := by
-  intro tx ty _i htx hty _hi                              -- Unpack 2D thread bounds `tx < W` and `ty < H`
+  intro tx ty _i htx hty _hi                                     -- Unpack 2D thread bounds `tx < W` and `ty < H`
   exact CudaOxide.Proofs.Launch.launched_index_fits hty htx hfit -- `ty * W + tx < H * W ≤ bufferLen`
 
-/-- Discharges `NoOobTileAccess` for a 2D row scan (`ty * W + i < bufLen`). -/
+/-- Proves `no_oob_idx(TILE)` for a row scan `TILE[ty * W + i]`: in-bounds when
+    `ty < H`, loop step `i < W`, and `H * W ≤ bufferLen`. -/
 theorem no_oob_tile_row_scan {blockDimX blockDimY bufferLen : Nat}
     (hfit : blockDimY * blockDimX ≤ bufferLen) :
     NoOobTileAccess blockDimX blockDimY blockDimX (.rowScan blockDimX) bufferLen := by
-  intro _tx ty i _htx hty hi                              -- Unpack row bound `ty < H` and loop step `i < W`
+  intro _tx ty i _htx hty hi                                     -- Unpack row bound `ty < H` and loop step `i < W`
   exact CudaOxide.Proofs.Launch.launched_index_fits hty hi hfit  -- `ty * W + i < H * W ≤ bufferLen`
 
-/-- Discharges `NoOobTileAccess` for a 2D column scan (`i * W + tx < bufLen`). -/
+/-- Proves `no_oob_idx(TILE)` for a column scan `TILE[i * W + tx]`: in-bounds
+    when loop step `i < H`, `tx < W`, and `H * W ≤ bufferLen`. -/
 theorem no_oob_tile_col_scan {blockDimX blockDimY bufferLen : Nat}
     (hfit : blockDimY * blockDimX ≤ bufferLen) :
     NoOobTileAccess blockDimX blockDimY blockDimY (.colScan blockDimX) bufferLen := by
-  intro tx _ty i htx _hty hi                              -- Unpack col bound `tx < W` and loop step `i < H`
+  intro tx _ty i htx _hty hi                                     -- Unpack col bound `tx < W` and loop step `i < H`
   exact CudaOxide.Proofs.Launch.launched_index_fits hi htx hfit  -- `i * W + tx < H * W ≤ bufferLen`
 
-/-- Discharges `NoOobRowStrip` for a hoisted 2D row-strip check (`a[a_start + a_col]`). -/
+/-- Proves `no_oob_idx(a)` for a 2D row access `a[start + col]`: in-bounds when
+    the row's last element `start + (cols - 1) < bufferLen` and `col < cols`. -/
 theorem no_oob_row_strip {bufferLen : Nat} :
     NoOobRowStrip bufferLen := by
   intro _start _cols _col _hpos _hlast _hcol              -- Unpack `start + (cols - 1) < bufferLen` and `col < cols`
   omega                                                   -- Linear solver proves `start + col < bufferLen`
 
-/-- Discharges `NoOobColStrip` for a hoisted 2D column-strip check (`b[b_start + b_row * n]`). -/
+/-- Proves `no_oob_idx(b)` for a 2D column access `b[start + row * stride]`:
+    in-bounds when the column's last element `(rows - 1) * stride + start < bufferLen`
+    and `row < rows`. -/
 theorem no_oob_col_strip {bufferLen : Nat} :
     NoOobColStrip bufferLen := by
   intro _start stride rows row _hpos _hlast _hrow         -- Unpack `(rows - 1) * stride + start < bufferLen` and `row < rows`

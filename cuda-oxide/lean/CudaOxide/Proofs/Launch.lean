@@ -19,7 +19,8 @@ Reusable theorems over `CudaOxide.Mir.globalIndex`, `Thread1D`, and
 namespace CudaOxide.Proofs.Launch
 open CudaOxide.Mir CudaOxide.Mir.Kernel CudaOxide.Contracts
 
-/-- The global index of a launched lane is below the total thread count. -/
+/-- If `block < blocks` and `lane < blockSize`, then the linear index
+    `block * blockSize + lane` is strictly below `blocks * blockSize`. -/
 theorem launched_index_bound {blocks blockSize block lane : Nat}
     (hblock : block < blocks) (hlane : lane < blockSize) :
     globalIndex blockSize block lane < blocks * blockSize := by
@@ -29,24 +30,24 @@ theorem launched_index_bound {blocks blockSize block lane : Nat}
   unfold globalIndex                                      -- Step 4: Replace `globalIndex` in goal with `block * blockSize + lane`
   omega                                                   -- Step 5: Linear solver finishes using `hlane : lane < blockSize`
 
-/-- The bound is explicit. For cuda-oxide `index_1d` on 64-bit `usize`, use
-    `limit = 2^64 - 1`: the helper reserves `usize::MAX` as an invalid sentinel. -/
+/-- If `block < blocks`, `lane < blockSize`, and the total thread count fits
+    inside `limit` (`blocks * blockSize ≤ limit`), then `block * blockSize + lane < limit`. -/
 theorem launched_index_fits {blocks blockSize block lane limit : Nat}
     (hblock : block < blocks) (hlane : lane < blockSize)
     (hlimit : blocks * blockSize ≤ limit) :
     globalIndex blockSize block lane < limit := by
   exact Nat.lt_of_lt_of_le (launched_index_bound hblock hlane) hlimit -- Chain `idx < blocks * blockSize` with `≤ limit`
 
-/-- A strict bound below the reserved index value excludes the invalid sentinel
-    used by the `cuda-oxide` `index_1d` helper. -/
+/-- If the total thread count fits inside `sentinel` (`blocks * blockSize ≤ sentinel`),
+    no valid thread's index can ever equal `sentinel`. -/
 theorem launched_index_not_sentinel {blocks blockSize block lane sentinel : Nat}
     (hblock : block < blocks) (hlane : lane < blockSize)
     (hlimit : blocks * blockSize ≤ sentinel) :
     globalIndex blockSize block lane ≠ sentinel := by
   exact Nat.ne_of_lt (launched_index_fits hblock hlane hlimit)        -- Strict `< sentinel` implies `≠ sentinel`
 
-/-- Distinct launched `(block, lane)` pairs cannot share the same global index.
-    Bounding both lanes is essential. -/
+/-- Two threads with the same linear index (`block₁ * B + lane₁ = block₂ * B + lane₂`)
+    must have the exact same `block` and `lane`. -/
 theorem globalIndex_injective {blockSize block₁ block₂ lane₁ lane₂ : Nat}
     (hlane₁ : lane₁ < blockSize) (hlane₂ : lane₂ < blockSize)
     (hsame : globalIndex blockSize block₁ lane₁ =
@@ -64,7 +65,8 @@ theorem globalIndex_injective {blockSize block₁ block₂ lane₁ lane₂ : Nat
       Nat.div_eq_of_lt hlane₁, Nat.div_eq_of_lt hlane₂] using hdiv -- to `block + 0 = block`
   exact ⟨hblock, hlane⟩                                   -- Step 4: Pair `block₁ = block₂` and `lane₁ = lane₂`
 
-/-- Discharges `DisjointWrites` for a 1D kernel writing at `globalIndex + offset`. -/
+/-- Proves `disjoint_writes(buf)`: two different 1D threads writing to `idx + offset`
+    never write to the same buffer element. -/
 theorem disjoint_writes_1d {blockSize offset : Nat} :
     DisjointWrites blockSize offset := by
   intro block₁ block₂ lane₁ lane₂ hlane₁ hlane₂ hsame     -- Unpack the `∀` variables and `→` premises of `DisjointWrites`
@@ -73,8 +75,8 @@ theorem disjoint_writes_1d {blockSize offset : Nat} :
         globalIndex blockSize block₂ lane₂ := Nat.add_right_cancel hsame
   exact globalIndex_injective hlane₁ hlane₂ hbase         -- Apply injectivity of `globalIndex`
 
-/-- Sufficient launch coverage: every output index belongs to a launched
-    block and lane. -/
+/-- When `outLen ≤ blocks * blockSize`, every output element `i < outLen` is
+    covered by thread `(block = i / blockSize, lane = i % blockSize)`. -/
 theorem launch_coverage {blocks blockSize outLen i : Nat}
     (hpositive : 0 < blockSize) (hcoverage : outLen ≤ blocks * blockSize)
     (hi : i < outLen) :
@@ -86,26 +88,26 @@ theorem launch_coverage {blocks blockSize outLen i : Nat}
   · exact Nat.mod_lt i hpositive                          -- Goal 2 (`i % blockSize < blockSize`): remainder is `< divisor`
   · simpa [globalIndex, Nat.mul_comm] using Nat.div_add_mod i blockSize -- Goal 3: `(i / B) * B + (i % B) = i`
 
-/-- Discharges `WritesAllElems` for a 1D launch when `0 < blockSize` and
-    `outLen ≤ blocks * blockSize`. -/
+/-- Proves `writes_all_elems(buf)`: every element `i < outLen` is written by
+    some thread when the grid has at least `outLen` threads. -/
 theorem writes_all_elems_1d {blocks blockSize outLen : Nat}
     (hpositive : 0 < blockSize) (hcoverage : outLen ≤ blocks * blockSize) :
     WritesAllElems blocks blockSize outLen := by
   intro i hi                                              -- Unpack `∀ i, i < outLen → ...` from `WritesAllElems`
   exact launch_coverage hpositive hcoverage hi            -- Discharge with `launch_coverage`
 
-/-- A typed thread supplies its launch-bounds proofs from its fields. -/
+/-- Every typed `Thread1D` has a linear index `< blocks * blockSize`. -/
 theorem thread_index_bound {blocks blockSize : Nat}
     (thread : Thread1D blocks blockSize) :
     thread.index < blocks * blockSize := by
   exact launched_index_bound thread.block.isLt thread.lane.isLt -- `.isLt` extracts `val < n` from each `Fin n` field
 
-/-- Convert a launched thread into an address carrying the proved total bound. -/
+/-- Bundle a `Thread1D`'s linear index with its `< blocks * blockSize` proof as a `Fin`. -/
 def thread_address {blocks blockSize : Nat}
     (thread : Thread1D blocks blockSize) : Fin (blocks * blockSize) :=
   ⟨thread.index, thread_index_bound thread⟩
 
-/-- Equal logical indices identify the same typed thread. -/
+/-- Two `Thread1D` values with the same linear index are the exact same thread. -/
 theorem thread_index_injective {blocks blockSize : Nat}
     (first second : Thread1D blocks blockSize)
     (hsame : first.index = second.index) : first = second := by
@@ -118,8 +120,8 @@ theorem thread_index_injective {blocks blockSize : Nat}
   cases hlane                                             -- Substitute `secondLane` with `firstLane`
   rfl                                                     -- Both sides are now identical (`⟨firstBlock, firstLane⟩`)
 
-/-- Discharges `NoDataRace` for a per-thread 2D staging write (`TILE[ty * W + tx]`):
-    distinct threads in the same phase never write the same slot. -/
+/-- Proves `no_data_race(TILE)` for Phase 0 writes (`TILE[ty * W + tx] = val`):
+    different `(tx, ty)` threads always write to different slots in `TILE`. -/
 theorem no_data_race_thread_slot {blockDimX blockDimY bufId phase loopBound : Nat}
     {kind₁ kind₂ : Kernel.AccessKind} {space₁ space₂ : Kernel.MemorySpace} :
     NoDataRace blockDimX blockDimY
@@ -131,16 +133,16 @@ theorem no_data_race_thread_slot {blockDimX blockDimY bufId phase loopBound : Na
   have hinj := globalIndex_injective htx₁ htx₂ hsame      -- `ty₁ * W + tx₁ = ty₂ * W + tx₂` implies `ty₁ = ty₂ ∧ tx₁ = tx₂`
   exact ⟨hinj.2, hinj.1⟩                                  -- Reorder `ty₁ = ty₂ ∧ tx₁ = tx₂` into `tx₁ = tx₂ ∧ ty₁ = ty₂`
 
-/-- Discharges `NoDataRace` when two accesses occur in different barrier phases
-    (`a₁.phase ≠ a₂.phase`), because `sync_threads()` separates them in time. -/
+/-- Proves `no_data_race(TILE)` between Phase 0 writes and Phase 1 reads:
+    accesses in different phases (`phase₁ ≠ phase₂`) are separated by `sync_threads()`. -/
 theorem no_data_race_diff_phase {blockDimX blockDimY : Nat}
     {a₁ a₂ : Kernel.PhasedTileAccess} (hsep : a₁.phase ≠ a₂.phase) :
     NoDataRace blockDimX blockDimY a₁ a₂ := by
   intro _tx₁ _ty₁ _i₁ _tx₂ _ty₂ _i₂ _ _ _ _ _ _ _ hphase _ _ -- Unpack premises including `hphase : a₁.phase = a₂.phase`
   exact False.elim (hsep hphase)                          -- Contradiction: `a₁.phase ≠ a₂.phase` vs. `a₁.phase = a₂.phase`
 
-/-- Discharges `NoDataRace` when both accesses are reads (`a₁.kind = .read` and
-    `a₂.kind = .read`), because concurrent reads never conflict. -/
+/-- Proves `no_data_race(TILE)` when both accesses only read (`kind = .read`):
+    two reads never race with each other. -/
 theorem no_data_race_read_only {blockDimX blockDimY : Nat}
     {a₁ a₂ : Kernel.PhasedTileAccess}
     (hr₁ : a₁.kind = .read) (hr₂ : a₂.kind = .read) :
@@ -150,8 +152,8 @@ theorem no_data_race_read_only {blockDimX blockDimY : Nat}
   · rw [hr₁] at hw₁; contradiction                        -- `.read = .write` is impossible
   · rw [hr₂] at hw₂; contradiction                        -- `.read = .write` is impossible
 
-/-- Discharges `UniformBarriers` when the CFG barrier analysis confirms uniform
-    control flow and a positive barrier count. -/
+/-- Proves `uniform_barriers` when the kernel has at least one barrier and all
+    barriers sit outside thread-divergent `if` branches. -/
 theorem uniform_barriers_of_checked {numBarriers : Nat}
     (hpos : 0 < numBarriers) :
     UniformBarriers true numBarriers := by

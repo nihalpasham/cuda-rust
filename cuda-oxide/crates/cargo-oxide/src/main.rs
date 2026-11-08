@@ -499,10 +499,10 @@ enum Commands {
     /// Inspect scalar MIR and its generated Lean model (source checkout only)
     #[command(name = "lean-export")]
     LeanExport {
-        /// MIR file to export; omit to use the bundled hand-authored demo
-        #[arg(value_name = "INPUT", requires = "function")]
+        /// Verified example name (`verified_vecadd`, `verified_gemm_views`) or MIR file path
+        #[arg(value_name = "INPUT")]
         input: Option<PathBuf>,
-        /// Exact MIR function symbol (required with a custom input)
+        /// Exact MIR function symbol (required when INPUT is a `.mir` file)
         #[arg(long, value_name = "NAME", requires = "input")]
         function: Option<String>,
     },
@@ -1371,15 +1371,20 @@ mod tests {
         };
         assert_eq!(input, Some(PathBuf::from("path with spaces/input.mir")));
         assert_eq!(function.as_deref(), Some("global_index"));
-        for args in [
-            vec!["cargo-oxide", "lean-export", "input.mir"],
-            vec!["cargo-oxide", "lean-export", "--function", "global_index"],
-        ] {
-            let error = Cli::try_parse_from(args)
+        let by_example =
+            Cli::try_parse_from(["cargo-oxide", "lean-export", "verified_vecadd"]).unwrap();
+        assert!(matches!(
+            by_example.command,
+            Commands::LeanExport {
+                input: Some(_),
+                function: None
+            }
+        ));
+        let error =
+            Cli::try_parse_from(["cargo-oxide", "lean-export", "--function", "global_index"])
                 .err()
-                .expect("must require both arguments");
-            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        }
+                .expect("must require input when --function is passed");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
