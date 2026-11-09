@@ -561,4 +561,45 @@ fn verifies_2d_sgemm_tiled_views_and_rejects_shared_races_oob_and_divergent_barr
         err.to_string().contains("omega could not prove the goal"),
         "unexpected Lean error for divergent barrier: {err}"
     );
+
+    // Stage 2 (`sgemm_tiled_raw`): Verify 2D global slice `RowStrip` (`a`) and `ColStrip` (`b`)
+    // are extracted from MIR pointer-offset math rather than parameter list order.
+    let raw_baseline =
+        export_named_source(SGEMM_TILED_FIXTURE, "sgemm_tiled_raw").expect("valid sgemm_tiled_raw");
+    assert!(raw_baseline.contains(
+        "theorem verify_no_oob_idx_param4 (bufferLen : Nat) :\n    CudaOxide.Contracts.NoOobRowStrip bufferLen"
+    ));
+    assert!(raw_baseline.contains(
+        "theorem verify_no_oob_idx_param5 (bufferLen : Nat) :\n    CudaOxide.Contracts.NoOobColStrip bufferLen"
+    ));
+    lean_exporter::runner::check_generated_lean(&raw_baseline, &lean_dir)
+        .expect("valid sgemm_tiled_raw MIR must pass Lean 4 verification");
+
+    // Reversing the attribute list (`"5,4"` instead of `"4,5"`) must still map param 5 (`b`)
+    // to `NoOobColStrip` and param 4 (`a`) to `NoOobRowStrip`.
+    let swapped_order = SGEMM_TILED_FIXTURE.replace(
+        "verify_no_oob_idx: builtin.string \"4,5\"",
+        "verify_no_oob_idx: builtin.string \"5,4\"",
+    );
+    let swapped_lean =
+        export_named_source(&swapped_order, "sgemm_tiled_raw").expect("swapped order still valid");
+    assert!(swapped_lean.contains(
+        "theorem verify_no_oob_idx_param5 (bufferLen : Nat) :\n    CudaOxide.Contracts.NoOobColStrip bufferLen"
+    ));
+    assert!(swapped_lean.contains(
+        "theorem verify_no_oob_idx_param4 (bufferLen : Nat) :\n    CudaOxide.Contracts.NoOobRowStrip bufferLen"
+    ));
+
+    // Negative check: indexing global slice `a` by a non-strip index (`a_len` instead of `a_idx`)
+    // must be rejected fail-closed by `translate.rs`.
+    let bad_global_offset = SGEMM_TILED_FIXTURE.replace(
+        "a_elem = mir.ptr_offset (a_ptr, a_idx)",
+        "a_elem = mir.ptr_offset (a_ptr, a_len)",
+    );
+    let err = export_named_source(&bad_global_offset, "sgemm_tiled_raw").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("2D global slice pointer offset must use a row-strip"),
+        "unexpected error for bad 2D global slice offset: {err}"
+    );
 }

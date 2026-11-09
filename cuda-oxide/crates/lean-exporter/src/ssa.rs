@@ -47,6 +47,15 @@ pub enum TileAccessPatternKind {
     },
 }
 
+/// 2D global slice strip indexing shape in a tiled 2D kernel (`sgemm_tiled_raw`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GlobalStripKind {
+    /// Contiguous row strip `start + col` (derived from `tx` with unit stride).
+    RowStrip,
+    /// Strided column strip `start + row * stride` (derived from `ty * stride`).
+    ColStrip,
+}
+
 /// Semantic type and provenance of an SSA value in `dialect-mir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SsaKind {
@@ -191,6 +200,19 @@ pub enum SsaKind {
         pattern: TileAccessPatternKind,
         /// Exclusive upper bound on `i`.
         loop_bound: u64,
+    },
+    /// 2D global row-strip index `start + col` (derived from `tx` without runtime stride multiply).
+    StripColOffset,
+    /// 2D unscaled row coordinate `tile_start + ty` (before multiplying by runtime stride `n`).
+    StripRowOffset,
+    /// 2D global col-strip index `start + row * stride` (derived from `ty` scaled by runtime stride).
+    StripColStrided,
+    /// Element pointer `&slice[strip_idx]` into a 2D global slice parameter.
+    GlobalStripElementPtr {
+        /// Target slice parameter index (`0..arity`).
+        param: usize,
+        /// Row-strip (`start + col`) vs. column-strip (`start + row * stride`) pattern.
+        kind: GlobalStripKind,
     },
     /// Loaded element or arithmetic value that does not affect indexing.
     DataValue,

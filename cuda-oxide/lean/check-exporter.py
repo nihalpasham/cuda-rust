@@ -159,6 +159,27 @@ def main():
             raise RuntimeError(f"Expected missing `sync_threads()` to fail NoDataRace in Lean:\n{res_race.stdout}")
         print("REJECTED as expected: missing `sync_threads()` between write and read fails `no_data_race`.", flush=True)
 
+        # Verified 2D sgemm_tiled_raw global strip checks (RowStrip on `a`, ColStrip on `b`)
+        sgemm_raw_lean = require_export(SGEMM_TILED_FIXTURE, "sgemm_tiled_raw")
+        sgemm_raw_valid = temporary / "SgemmRawValid.lean"
+        sgemm_raw_valid.write_text(sgemm_raw_lean)
+        require_success("env", "lean", str(sgemm_raw_valid))
+        print("PASS: exported 2D sgemm_tiled_raw MIR proves global RowStrip/ColStrip and shared-memory obligations.", flush=True)
+
+        # Mutate sgemm_tiled_raw MIR to index `a` with an unguarded/non-strip offset `a_len`:
+        bad_strip_mir = temporary / "sgemm_bad_strip.mir"
+        bad_strip_mir.write_text(
+            sgemm_source.replace(
+                "a_elem = mir.ptr_offset (a_ptr, a_idx)",
+                "a_elem = mir.ptr_offset (a_ptr, a_len)",
+                1,
+            )
+        )
+        rejected_strip = export(bad_strip_mir, "sgemm_tiled_raw")
+        if rejected_strip.returncode == 0 or "2D global slice pointer offset must use a row-strip" not in rejected_strip.stderr:
+            raise RuntimeError(f"Expected non-strip 2D global slice access to be rejected:\n{rejected_strip.stderr}")
+        print("REJECTED as expected: non-strip 2D global slice access is rejected before Lean.", flush=True)
+
     print("Exporter checks passed for scalar, 1D vecadd, and 2D phased shared-memory SGEMM fixtures.")
 
 

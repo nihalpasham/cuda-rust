@@ -100,29 +100,42 @@ builtin.module @verified_gemm_views {
 
       ^phase0_stage():
         c16_u32 = mir.constant () [] [value: builtin.integer <16: ui32>]: <() -> (builtin.integer ui32)>;
+        tile_start = mir.mul (tile, c16_u32) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer ui32)>;
         ty_scaled = mir.mul (ty, c16_u32) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer ui32)>;
         smem_u32 = mir.add (ty_scaled, tx) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer ui32)>;
         smem_idx = mir.cast (smem_u32) [] [cast_kind: mir.cast_kind IntToInt]: <(builtin.integer ui32) -> (builtin.integer ui64)>;
+        a_col = mir.add (tile_start, tx) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer ui32)>;
+        a_idx = mir.cast (a_col) [] [cast_kind: mir.cast_kind IntToInt]: <(builtin.integer ui32) -> (builtin.integer ui64)>;
         a_len = mir.extract_field (a) [] [index: mir.field_index 1]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (builtin.integer ui64)>;
-        ok_a_global = mir.lt (smem_idx, a_len) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
+        ok_a_global = mir.lt (a_idx, a_len) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
         mir.assert (ok_a_global) [] []: <(builtin.integer i1) -> ()>;
+        a_ptr = mir.extract_field (a) [] [index: mir.field_index 0]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;
+        a_elem = mir.ptr_offset (a_ptr, a_idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;
+        a_val = mir.load (a_elem) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>) -> (builtin.fp32)>;
+        b_row = mir.add (tile_start, ty) [] []: <(builtin.integer ui32, builtin.integer ui32) -> (builtin.integer ui32)>;
+        b_row_u64 = mir.cast (b_row) [] [cast_kind: mir.cast_kind IntToInt]: <(builtin.integer ui32) -> (builtin.integer ui64)>;
+        n_u64 = mir.cast (n) [] [cast_kind: mir.cast_kind IntToInt]: <(builtin.integer ui32) -> (builtin.integer ui64)>;
+        b_idx = mir.mul (b_row_u64, n_u64) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;
         b_len = mir.extract_field (b) [] [index: mir.field_index 1]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (builtin.integer ui64)>;
-        ok_b_global = mir.lt (smem_idx, b_len) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
+        ok_b_global = mir.lt (b_idx, b_len) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
         mir.assert (ok_b_global) [] []: <(builtin.integer i1) -> ()>;
+        b_ptr = mir.extract_field (b) [] [index: mir.field_index 0]: <(mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;
+        b_elem = mir.ptr_offset (b_ptr, b_idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>)>;
+        b_val = mir.load (b_elem) [] []: <(mir.ptr <builtin.fp32 ,mutable:false,addrspace:0,kind:Erased>) -> (builtin.fp32)>;
         tile_a_raw = mir.shared_alloc () [] [elem_type: builtin.type builtin.fp32, size: builtin.integer <256: i64>, alloc_key: builtin.string "TILE_A", source_name: builtin.string "gemm_views::kernels::sgemm_tiled_raw::TILE_A"]: <() -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:Erased>)>;
         tile_a_mut = mir.cast (tile_a_raw) [] [cast_kind: mir.cast_kind PtrToPtr, pointer_kind_authority: mir.pointer_kind_authority Reborrow]: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:Erased>) -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>)>;
         c256_a = mir.constant () [] [value: builtin.integer <256: ui64>]: <() -> (builtin.integer ui64)>;
         ok_a_write = mir.lt (smem_idx, c256_a) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
         mir.assert (ok_a_write) [] []: <(builtin.integer i1) -> ()>;
         slot_a = mir.ptr_offset (tile_a_mut, smem_idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>)>;
-        mir.store (slot_a, alpha) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.fp32) -> ()>;
+        mir.store (slot_a, a_val) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.fp32) -> ()>;
         tile_b_raw = mir.shared_alloc () [] [elem_type: builtin.type builtin.fp32, size: builtin.integer <256: i64>, alloc_key: builtin.string "TILE_B", source_name: builtin.string "gemm_views::kernels::sgemm_tiled_raw::TILE_B"]: <() -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:Erased>)>;
         tile_b_mut = mir.cast (tile_b_raw) [] [cast_kind: mir.cast_kind PtrToPtr, pointer_kind_authority: mir.pointer_kind_authority Reborrow]: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:Erased>) -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>)>;
         c256_b = mir.constant () [] [value: builtin.integer <256: ui64>]: <() -> (builtin.integer ui64)>;
         ok_b_write = mir.lt (smem_idx, c256_b) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer i1)>;
         mir.assert (ok_b_write) [] []: <(builtin.integer i1) -> ()>;
         slot_b = mir.ptr_offset (tile_b_mut, smem_idx) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.integer ui64) -> (mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>)>;
-        mir.store (slot_b, beta) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.fp32) -> ()>;
+        mir.store (slot_b, b_val) [] []: <(mir.ptr <builtin.fp32 ,mutable:true,addrspace:3,kind:UniqueRef>, builtin.fp32) -> ()>;
         nvvm.barrier0 () [] []: <() -> ()>;
         zero_i = mir.constant () [] [value: builtin.integer <0: ui64>]: <() -> (builtin.integer ui64)>;
         mir.goto (sum_outer, zero_i) [^scan_header] []: <(builtin.fp32, builtin.integer ui64) -> ()>

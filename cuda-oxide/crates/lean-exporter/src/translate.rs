@@ -45,7 +45,7 @@ use crate::{
         KernelVerificationSpec, get_string_attr, has_verification_attributes,
         parse_kernel_verification_spec,
     },
-    ssa::{SsaEnv, SsaKind, TileAccessPatternKind},
+    ssa::{GlobalStripKind, SsaEnv, SsaKind, TileAccessPatternKind},
 };
 
 /// Direction of an extracted buffer access.
@@ -89,6 +89,16 @@ pub struct PhasedSharedAccess {
     pub loop_bound: u64,
 }
 
+/// One 2D global slice strip access (`start + col` or `start + row * stride`)
+/// extracted from `PostMem2Reg` `dialect-mir`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GlobalStripAccess2D {
+    /// Accessed kernel slice parameter index (`0..arity`).
+    pub param: usize,
+    /// Row-strip (`start + col`) vs. column-strip (`start + row * stride`) shape.
+    pub kind: GlobalStripKind,
+}
+
 /// Output of the unified MIR translator before rendering to `.lean` text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranslatedFunction {
@@ -122,6 +132,8 @@ pub enum TranslatedFunction {
         num_barriers: usize,
         /// Whether all barriers execute in thread-uniform control flow.
         barriers_uniform: bool,
+        /// 2D global slice strip accesses extracted from the kernel CFG.
+        global_strip_accesses: Vec<GlobalStripAccess2D>,
         /// Phased shared-memory reads and writes extracted from the kernel CFG.
         shared_accesses: Vec<PhasedSharedAccess>,
         /// `mir.assert` bounds-check operations proven redundant by `no_oob_idx`.
@@ -1083,8 +1095,13 @@ fn translate_verified_2d_tiled_kernel(
                 changed = true;
             }
         };
-        for &b_ptr in &blocks {
+        for (b_idx, &b_ptr) in blocks.iter().enumerate() {
             let block = b_ptr.deref(ctx);
+            if b_idx != 0 {
+                for arg in block.arguments() {
+                    update(&mut env, arg, SsaKind::DataValue);
+                }
+            }
             // Detect inner scan loop counter `i < bound` on block arguments.
             if block.get_num_arguments() >= 2 {
                 let step_arg = block.get_argument(1);
@@ -1185,6 +1202,14 @@ fn translate_verified_2d_tiled_kernel(
                                 loop_bound: Some(bound),
                                 stride: u64::try_from(s).unwrap_or(u64::MAX),
                             },
+                            (
+                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
+                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
+                            )
+                            | (
+                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
+                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
+                            ) => SsaKind::StripColStrided,
                             _ => SsaKind::DataValue,
                         };
                         update(&mut env, op.get_result(0), mapped);
@@ -1244,6 +1269,26 @@ fn translate_verified_2d_tiled_kernel(
                                 pattern: TileAccessPatternKind::ColScan { stride },
                                 loop_bound: bound,
                             },
+                            (
+                                Some(SsaKind::TidX | SsaKind::StripColOffset),
+                                Some(SsaKind::DataValue),
+                            )
+                            | (
+                                Some(SsaKind::DataValue),
+                                Some(SsaKind::TidX | SsaKind::StripColOffset),
+                            ) => SsaKind::StripColOffset,
+                            (
+                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
+                                Some(SsaKind::DataValue),
+                            )
+                            | (
+                                Some(SsaKind::DataValue),
+                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
+                            ) => SsaKind::StripRowOffset,
+                            (Some(SsaKind::StripColStrided), Some(SsaKind::DataValue))
+                            | (Some(SsaKind::DataValue), Some(SsaKind::StripColStrided)) => {
+                                SsaKind::StripColStrided
+                            }
                             _ => SsaKind::DataValue,
                         };
                         update(&mut env, op.get_result(0), mapped);
@@ -1282,9 +1327,10 @@ fn translate_verified_2d_tiled_kernel(
                                     loop_bound: 1,
                                 }
                             }
-                            (_, Some(SsaKind::SliceLen(guard_param))) => {
-                                SsaKind::IndexLtLen { guard_param }
-                            }
+                            (
+                                Some(SsaKind::StripColOffset | SsaKind::StripColStrided),
+                                Some(SsaKind::SliceLen(guard_param)),
+                            ) => SsaKind::IndexLtLen { guard_param },
                             _ => SsaKind::DataValue,
                         };
                         update(&mut env, op.get_result(0), mapped);
@@ -1313,7 +1359,7 @@ fn translate_verified_2d_tiled_kernel(
                         } else if let (
                             Some(SsaKind::SharedBasePtr { shared_id, size }),
                             Some(SsaKind::TidX),
-                        ) = (base, idx)
+                        ) = (base.clone(), idx.clone())
                         {
                             update(
                                 &mut env,
@@ -1325,6 +1371,32 @@ fn translate_verified_2d_tiled_kernel(
                                         stride: u64::from(spec.block_size),
                                     },
                                     loop_bound: 1,
+                                },
+                            );
+                        } else if let (
+                            Some(SsaKind::SlicePtr(param)),
+                            Some(SsaKind::StripColOffset),
+                        ) = (base.clone(), idx.clone())
+                        {
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::GlobalStripElementPtr {
+                                    param,
+                                    kind: GlobalStripKind::RowStrip,
+                                },
+                            );
+                        } else if let (
+                            Some(SsaKind::SlicePtr(param)),
+                            Some(SsaKind::StripColStrided),
+                        ) = (base, idx)
+                        {
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::GlobalStripElementPtr {
+                                    param,
+                                    kind: GlobalStripKind::ColStrip,
                                 },
                             );
                         } else if op.get_num_results() == 1 {
@@ -1344,9 +1416,11 @@ fn translate_verified_2d_tiled_kernel(
         }
     }
 
-    // 5. Collect phased shared-memory accesses and proven `mir.assert` nodes
-    //    (and reject any shared-memory `mir.ptr_offset` that did not resolve to
-    //    a recognized 2D tile coordinate).
+    // 5. Collect 2D global strip accesses, phased shared-memory accesses, and
+    //    proven `mir.assert` nodes (rejecting any verified global slice or
+    //    shared-memory `mir.ptr_offset` that did not resolve to a recognized
+    //    2D coordinate pattern).
+    let mut global_strip_accesses = Vec::new();
     let mut shared_accesses = Vec::new();
     let mut proven_assert_ops = Vec::new();
     for (b_idx, &b_ptr) in blocks.iter().enumerate() {
@@ -1367,6 +1441,18 @@ fn translate_verified_2d_tiled_kernel(
                             "shared memory pointer offset must use a recognized 2D tile coordinate",
                         ));
                     }
+                    if let Some(SsaKind::SlicePtr(param)) = env.get_kind(&op.get_operand(0))
+                        && spec.no_oob_idx.contains(&param)
+                        && !matches!(
+                            env.get_kind(&op.get_result(0)),
+                            Some(SsaKind::GlobalStripElementPtr { .. })
+                        )
+                    {
+                        return Err(reject(
+                            "mir.ptr_offset",
+                            "2D global slice pointer offset must use a row-strip (`start + col`) or col-strip (`start + row * stride`) index",
+                        ));
+                    }
                 }
                 "mir.assert" => {
                     if op.get_num_operands() == 1 {
@@ -1385,14 +1471,13 @@ fn translate_verified_2d_tiled_kernel(
                         }
                     }
                 }
-                "mir.load" => {
-                    if let Some(SsaKind::SharedElementPtr {
+                "mir.load" => match env.get_kind(&op.get_operand(0)) {
+                    Some(SsaKind::SharedElementPtr {
                         shared_id,
                         size,
                         pattern,
                         loop_bound,
-                    }) = env.get_kind(&op.get_operand(0))
-                    {
+                    }) => {
                         let shared_name = shared_raw_list
                             .get(shared_id)
                             .map(|(n, _)| n.clone())
@@ -1407,7 +1492,11 @@ fn translate_verified_2d_tiled_kernel(
                             loop_bound,
                         });
                     }
-                }
+                    Some(SsaKind::GlobalStripElementPtr { param, kind }) => {
+                        global_strip_accesses.push(GlobalStripAccess2D { param, kind });
+                    }
+                    _ => {}
+                },
                 "mir.store" => {
                     if let Some(SsaKind::SharedElementPtr {
                         shared_id,
@@ -1441,6 +1530,7 @@ fn translate_verified_2d_tiled_kernel(
         spec,
         num_barriers: barrier_blocks.len(),
         barriers_uniform,
+        global_strip_accesses,
         shared_accesses,
         proven_assert_ops,
     })

@@ -185,6 +185,13 @@ pub fn verify_module_kernels(
         let lean_code = render_lean_module(&translated)?;
         check_generated_lean(&lean_code, &lean_dir)?;
 
+        let strip_slice: &[crate::translate::GlobalStripAccess2D] = match &translated {
+            TranslatedFunction::TiledKernel2D {
+                global_strip_accesses,
+                ..
+            } => global_strip_accesses,
+            _ => &[],
+        };
         match &translated {
             TranslatedFunction::Kernel {
                 spec,
@@ -214,7 +221,7 @@ pub fn verify_module_kernels(
                     spec.domain, spec.block_size, spec.block_y
                 );
                 eprintln!("  requires:      {requires_list}");
-                for obligation in proved_obligation_descriptions(spec) {
+                for obligation in proved_obligation_descriptions(spec, strip_slice) {
                     eprintln!("  proved:        {obligation}");
                 }
                 eprintln!(

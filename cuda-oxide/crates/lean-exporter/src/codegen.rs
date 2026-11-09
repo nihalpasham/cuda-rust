@@ -15,8 +15,10 @@
 use crate::{
     ExportError, reject,
     spec::KernelVerificationSpec,
-    ssa::TileAccessPatternKind,
-    translate::{AccessKind, ExtractedAccess, PhasedSharedAccess, TranslatedFunction},
+    ssa::{GlobalStripKind, TileAccessPatternKind},
+    translate::{
+        AccessKind, ExtractedAccess, GlobalStripAccess2D, PhasedSharedAccess, TranslatedFunction,
+    },
 };
 
 /// Render any [`TranslatedFunction`] into a complete Lean 4 file.
@@ -48,23 +50,33 @@ pub fn render_lean_module(translated: &TranslatedFunction) -> Result<String, Exp
             spec,
             num_barriers,
             barriers_uniform,
+            global_strip_accesses,
             shared_accesses,
             ..
-        } => {
-            render_verified_tiled_2d_module(spec, *num_barriers, *barriers_uniform, shared_accesses)
-        }
+        } => render_verified_tiled_2d_module(
+            spec,
+            *num_barriers,
+            *barriers_uniform,
+            global_strip_accesses,
+            shared_accesses,
+        ),
     }
 }
 
-/// Return the list of human-readable obligation descriptions proven for `spec`.
-pub fn proved_obligation_descriptions(spec: &KernelVerificationSpec) -> Vec<String> {
+/// Return the list of human-readable obligation descriptions proven for `translated`.
+pub fn proved_obligation_descriptions(
+    spec: &KernelVerificationSpec,
+    global_strip_accesses: &[GlobalStripAccess2D],
+) -> Vec<String> {
     let mut items = Vec::new();
-    for (idx, &p) in spec.no_oob_idx.iter().enumerate() {
+    for &p in &spec.no_oob_idx {
         if spec.domain == 2 {
-            let contract = if idx % 2 == 0 {
-                "CudaOxide.Contracts.NoOobRowStrip"
-            } else {
-                "CudaOxide.Contracts.NoOobColStrip"
+            let contract = match global_strip_accesses.iter().find(|a| a.param == p) {
+                Some(GlobalStripAccess2D {
+                    kind: GlobalStripKind::ColStrip,
+                    ..
+                }) => "CudaOxide.Contracts.NoOobColStrip",
+                _ => "CudaOxide.Contracts.NoOobRowStrip",
             };
             items.push(format!("no_oob_idx(param {p}) -> {contract}"));
         } else {
@@ -278,6 +290,7 @@ fn render_verified_tiled_2d_module(
     spec: &KernelVerificationSpec,
     num_barriers: usize,
     barriers_uniform: bool,
+    global_strip_accesses: &[GlobalStripAccess2D],
     shared_accesses: &[PhasedSharedAccess],
 ) -> Result<String, ExportError> {
     let bx = u64::from(spec.block_size);
@@ -290,25 +303,42 @@ fn render_verified_tiled_2d_module(
     let mut theorems = Vec::new();
     let mut axiom_prints = Vec::new();
 
-    for (idx, &param) in spec.no_oob_idx.iter().enumerate() {
-        let thm_name = format!("verify_no_oob_idx_param{param}");
-        let (contract, lemma) = if idx % 2 == 0 {
-            (
-                "CudaOxide.Contracts.NoOobRowStrip",
-                "CudaOxide.Proofs.Bounds.no_oob_row_strip",
-            )
-        } else {
-            (
-                "CudaOxide.Contracts.NoOobColStrip",
-                "CudaOxide.Proofs.Bounds.no_oob_col_strip",
-            )
-        };
-        theorems.push(format!(
-            "theorem {thm_name} (bufferLen : Nat) :\n    \
-             {contract} bufferLen := by\n  \
-             exact {lemma}"
-        ));
-        axiom_prints.push(format!("#print axioms {thm_name}"));
+    for &param in &spec.no_oob_idx {
+        let matching: Vec<_> = global_strip_accesses
+            .iter()
+            .filter(|a| a.param == param)
+            .collect();
+        if matching.is_empty() {
+            return Err(reject(
+                "no_oob_idx",
+                format!(
+                    "parameter {param} is listed in `no_oob_idx` but never accessed in the kernel"
+                ),
+            ));
+        }
+        for (idx, acc) in matching.iter().enumerate() {
+            let thm_name = if matching.len() == 1 {
+                format!("verify_no_oob_idx_param{param}")
+            } else {
+                format!("verify_no_oob_idx_param{param}_{idx}")
+            };
+            let (contract, lemma) = match acc.kind {
+                GlobalStripKind::RowStrip => (
+                    "CudaOxide.Contracts.NoOobRowStrip",
+                    "CudaOxide.Proofs.Bounds.no_oob_row_strip",
+                ),
+                GlobalStripKind::ColStrip => (
+                    "CudaOxide.Contracts.NoOobColStrip",
+                    "CudaOxide.Proofs.Bounds.no_oob_col_strip",
+                ),
+            };
+            theorems.push(format!(
+                "theorem {thm_name} (bufferLen : Nat) :\n    \
+                 {contract} bufferLen := by\n  \
+                 exact {lemma}"
+            ));
+            axiom_prints.push(format!("#print axioms {thm_name}"));
+        }
     }
 
     for &shared_id in &spec.no_oob_shared {
