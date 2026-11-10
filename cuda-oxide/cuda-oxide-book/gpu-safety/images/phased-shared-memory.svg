@@ -107,7 +107,7 @@
     <!-- Thread t0 scanning across row -->
     <circle cx="130" cy="92" r="15" style="fill: var(--blue-soft); stroke: var(--blue)" stroke-width="2"/>
     <text x="130" y="96" text-anchor="middle" font-size="11" font-weight="700" style="fill: var(--blue-text)">t₀</text>
-    <text x="245" y="96" font-size="12" style="fill: var(--sub)">reads <tspan font-family="'Roboto Mono', monospace">i = 0 .. 15</tspan> across row</text>
+    <text x="156" y="96" font-size="12" style="fill: var(--sub)">reads <tspan font-family="'Roboto Mono', monospace">i = 0 .. 15</tspan> across row</text>
 
     <line x1="122" y1="110" x2="95"  y2="156" style="stroke: var(--blue)" stroke-width="1.8" marker-end="url(#arrow-b)"/>
     <line x1="128" y1="110" x2="165" y2="156" style="stroke: var(--blue)" stroke-width="1.8" marker-end="url(#arrow-b)"/>

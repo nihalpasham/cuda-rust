@@ -60,24 +60,46 @@ The compiler pauses in memory at `PostMem2Reg`, proves the kernel's obligations 
 | Block dimensions      | Taken as a given fact; stamped into PTX     | Checked once when preparing launch  | Hardware enforces block   |
 | Length requirements   | Taken as a given assumption in the proof    | Checked once right before launch    | Nothing (already checked) |
 
+### What Rust Proves vs. What Lean 4 Proves
+
+Unlike a C or CUDA C++ verifier, Lean 4 does not need to prove pointer validity, alignment, or buffer non-aliasing from scratch. However, the Rust compiler type-checks a kernel function as if a **single thread** called it, so we split the safety proof across the host boundary and the GPU launch:
+
+- **What transfers directly from Rust (Host to GPU)**:
+  - **Valid, aligned, live buffers**: Device buffers on the host are guaranteed non-null, aligned, and live for the launch.
+  - **Separate parameters never alias**: At the launch call site, Rust's borrow checker proves that a mutable output buffer does not overlap the read-only input buffers.
+  - **Shared read-only slices**: Copying `&[f32]` to thousands of GPU threads is sound because no thread mutates the input slices.
+- **What does *not* transfer from Rust alone**:
+  - Giving thousands of GPU threads a raw `&mut [f32]` (or shared-memory array) would let two threads mutate the same element at the same time.
+  - Per-element exclusivity across GPU threads is proved by `DisjointSlice` (for 1-thread-per-element outputs) or Lean 4 (across all thread pairs and barrier phases).
+
+| Property                                  | Who Proves It                          | Why It Holds on the GPU                                        |
+|:------------------------------------------|:---------------------------------------|:---------------------------------------------------------------|
+| **Buffers are non-null, aligned, live**   | Rust compiler at host launch           | Host passes typed device buffer references                     |
+| **Output does not alias inputs**          | Rust borrow checker at host launch     | Host cannot pass the same buffer as both shared and mutable    |
+| **Multiple readers on read-only slices**  | Rust type system (`Sync`)              | Immutable slices never race across GPU threads                 |
+| **Disjoint per-thread output writes**     | `DisjointSlice` or Lean 4              | Each thread only writes to its own unique output slot          |
+| **Shared-memory exclusivity**             | Lean 4 (`no_data_race` + barriers)     | Phase 0 writes one slot per thread or leader; Phase 1 reads    |
+| **In-bounds indexing**                    | Lean 4 (`no_oob_idx` + host check)     | Proved across all active threads before erasing bounds checks  |
+
 ### We Summarize the Kernel Instead of Translating Every Line
 
 The Lean exporter has two modes:
 - **Scalar mode**: Translates a pure integer function line-by-line into fixed-width bitvector math.
-- **Kernel mode**: Walks the kernel's control-flow graph to extract a **kernel summary** (which buffers are touched, under what `if` guards, and in which barrier phases) and emits one theorem per verification clause. Floating-point additions and multiplies are ignored because they cannot change array indices.
+- **Kernel mode**: Walks the kernel's control-flow graph using two buckets of state (**Bucket 1**: a map tracking each SSA variable's index or coordinate role, and **Bucket 2**: CFG lists tracking each basic block's barrier phase and `if` guards) to extract a **kernel summary** and emit one theorem per verification clause. Floating-point math is ignored because it cannot change array indices.
 
 How one `no_oob_idx` clause maps to the right reusable proof in Lean:
-- **1D global slice** (`a[idx]`): proved from the `if` guard and the host length check.
+- **1D global slice**: proved from the `if` guard and the host length check.
 - **2D global row or column strip**: proved from the strip start check and loop bound.
-- **Shared memory tile**: proved from the 2D thread coordinates (`tx < 16`, `ty < 16`) and loop bound (`i < 16`).
+- **2D shared memory tile**: proved from the 2D thread coordinates (`tx < 16`, `ty < 16`) and loop bound (`i < 16`).
+- **Shared warp-leader slot and scan**: proved from the block size (`tid < 256` implies `tid / 32 < 8`) and scan loop bound (`w < 8`).
 
 ### Trusted Computing Base
 
-Lean 4's kernel checks every proof obligation at `PostMem2Reg` and rejects any proof that uses `sorryAx` or custom axioms. Everything outside that proof check is part of the **Trusted Computing Base (TCB)**:
-- **MIR import and SSA promotion (`mir-importer`, `mem2reg`)**: Translating Rust into `dialect-mir` and promoting stack locals to `PostMem2Reg` SSA registers.
-- **The Lean translator (`lean-exporter`)**: Extracting the kernel summary and proof obligations from `PostMem2Reg` `dialect-mir` (fails closed on unsupported ops, unguarded accesses, or unknown attributes).
-- **Downstream lowering (`mir-transforms`, `mir-lower`, LLVM, `ptxas`)**: Erasing proven `mir.assert` checks, unrolling loops, and lowering `dialect-mir` to PTX after verification succeeds.
-- **Host launch checks and CUDA runtime**: Enforcing `#[launch_contract]` block dimensions and buffer length relations before the kernel runs.
+Lean 4's kernel checks every proof obligation and rejects any proof that uses `sorryAx` or custom axioms. Everything outside that proof check is part of the **Trusted Computing Base (TCB)**:
+- **MIR import and SSA promotion**: Translating Rust into MIR and promoting stack locals to SSA registers.
+- **The Lean translator**: Extracting the kernel summary and proof obligations from MIR (fails closed on unsupported ops, unguarded accesses, or unknown attributes).
+- **Downstream lowering**: Erasing proven bounds checks, unrolling loops, and lowering MIR to LLVM and PTX after verification succeeds.
+- **Host launch checks and CUDA runtime**: Enforcing launch-contract block dimensions and buffer length relations before the kernel runs.
 
 ---
 
@@ -229,3 +251,80 @@ $ cargo oxide run verified_gemm_views
 | Naive with views                 | Safe          | None (uses matrix views)         | ~7,225 GFLOPS      |
 | Tiled with views                 | Safe          | 4 shared-memory checks           | ~9,405 GFLOPS      |
 | Tiled without views (`tiled_raw`)| **Now Safe!** | 2 global + 4 shared-memory checks| ~9,390 GFLOPS      |
+
+---
+
+### Example 3: Warp & 2-Phase Block Reduction
+
+In a 256-thread block reduction, 8 warps of 32 threads sum 256 elements in two phases using an 8-element shared array (`WARP_SUMS`):
+- **Phase 0 (Warp Leader Stage)**: Every thread reduces across its 32-lane warp. Guarded by `if lane == 0`, only lane 0 of each warp writes its warp sum to `WARP_SUMS[tid / 32]`.
+- **Barrier**: All 256 threads wait at `sync_threads()`.
+- **Phase 1 (Block Scan)**: Each thread scans `w = 0..8` across `WARP_SUMS[w]` to accumulate the 256-thread block sum.
+
+```{figure} images/warp-leader-reduction.svg
+:alt: Leader-guarded warp and block reduction in shared memory
+:align: center
+:width: 100%
+
+In Phase 0, only lane 0 of each warp writes `WARP_SUMS[tid / 32]`, so each warp slot has a single writer. After the barrier, Phase 1 only reads.
+```
+
+Notice that the kernel uses the **exact same three verification clauses** as 2D tiled GEMM (`no_oob_idx`, `no_data_race`, `uniform_barriers`):
+
+```rust
+#[kernel(launch_context = lc)]
+#[launch_bounds(256)]
+#[launch_contract(
+    domain = 1,
+    coordinates = u32,
+    block = (256, 1, 1),
+    requires = (data.len() >= out.len()),
+)]
+#[verify(
+    no_oob_idx(WARP_SUMS),
+    no_data_race(WARP_SUMS),
+    uniform_barriers,
+)]
+pub fn block_reduce_sum(data: &[f32], mut out: DisjointSlice<f32>) {
+    static mut WARP_SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+
+    let idx = thread::index_1d();
+    let gid = idx.get();
+    let tid = thread::threadIdx_x() as usize;
+    let lane = warp::lane_id();
+
+    let val = if gid < data.len() { data[gid] } else { 0.0 };
+    let warp_sum = warp::reduce_sum_f32(val);
+
+    // Phase 0 (Lean-verified bounds and single leader writer per warp):
+    if lane == 0 {
+        WARP_SUMS[tid / 32] = warp_sum;
+    }
+
+    thread::sync_threads();
+
+    // Phase 1 (Lean-verified bounds and barrier separation):
+    let mut block_sum = 0.0f32;
+    let mut w = 0usize;
+    while w < 8 {
+        block_sum += WARP_SUMS[w];
+        w += 1;
+    }
+
+    if let Some(out_elem) = out.get_mut(idx) {
+        *out_elem = block_sum;
+    }
+}
+```
+
+How Lean 4 proves this kernel (and what happens if you make a mistake):
+- **Phase 0 bounds**: Because `tid < 256`, `tid / 32` is at most 7, which is strictly below 8.
+- **Phase 0 race freedom**: The exporter sees that the write happens inside `if lane == 0`. Lean 4 proves that two threads with `lane == 0` and the same warp index `tid / 32` must be the exact same thread. If you forget `if lane == 0`, Lean 4 rejects the build with a counterexample (threads 0 and 1 both write slot 0).
+- **Phase 1 bounds and barrier separation**: The loop bound `w < 8` stays inside the 8-element array, and `sync_threads()` separates Phase 0 writes from Phase 1 reads, erasing both shared-memory bounds checks before PTX lowering.
+
+Inspect both exported reduction kernels or run them on the GPU with:
+
+```console
+$ cargo oxide lean-export verified_warp_reduce
+$ cargo oxide run verified_warp_reduce
+```
