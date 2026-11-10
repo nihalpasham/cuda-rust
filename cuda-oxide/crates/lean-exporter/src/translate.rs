@@ -70,23 +70,25 @@ pub struct ExtractedAccess {
     pub index_offset: u64,
 }
 
-/// One phased 2D shared-memory tile access extracted from `PostMem2Reg` `dialect-mir`.
+/// One phased shared-memory tile or reduction access extracted from `PostMem2Reg` `dialect-mir`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhasedSharedAccess {
     /// Read or write operation.
     pub kind: AccessKind,
     /// Static `SharedArray` index (`0` for `TILE_A`, `1` for `TILE_B`, ...).
     pub shared_id: usize,
-    /// Short name of the `SharedArray` static (`"TILE_A"`, `"TILE_B"`, ...).
+    /// Short name of the `SharedArray` static (`"TILE_A"`, `"WARP_SUMS"`, ...).
     pub shared_name: String,
     /// Declared element count of the `SharedArray`.
     pub buffer_len: u64,
     /// Barrier phase index (`0` before first `sync_threads()`, `1` after first, ...).
     pub phase: usize,
-    /// 2D coordinate formula used to index the shared tile.
+    /// Coordinate formula used to index the shared buffer.
     pub pattern: TileAccessPatternKind,
     /// Exclusive upper bound on loop index `i` (`1` outside a scan loop).
     pub loop_bound: u64,
+    /// Whether this access is dominated by a leader guard (`lane == 0` / `tx % W == 0`).
+    pub leader_only: bool,
 }
 
 /// One 2D global slice strip access (`start + col` or `start + row * stride`)
@@ -154,6 +156,8 @@ pub fn translate_function(
     }
 }
 
+/// Validate that `ty` is an unsigned integer type of width `8`, `16`, `32`, or `64`
+/// and return its bit width.
 fn unsigned_width(ctx: &Context, ty: TypeHandle) -> Result<u32, ExportError> {
     let type_ref = ty.deref(ctx);
     let int = type_ref.downcast_ref::<IntegerType>().ok_or_else(|| {
@@ -171,6 +175,8 @@ fn unsigned_width(ctx: &Context, ty: TypeHandle) -> Result<u32, ExportError> {
     Ok(int.width())
 }
 
+/// Translate a single-block pure scalar integer `mir.func` into a
+/// [`TranslatedFunction::Scalar`] `BitVec` AST using [`SsaEnv`].
 fn translate_scalar_function(
     ctx: &Context,
     function: Ptr<Operation>,
@@ -334,6 +340,8 @@ fn translate_scalar_function(
     })
 }
 
+/// Translate a `#[verify(...)]` GPU kernel `mir.func` at `PostMem2Reg` into a
+/// 1D [`TranslatedFunction::Kernel`] or phased [`TranslatedFunction::TiledKernel2D`].
 fn translate_verified_kernel(
     ctx: &Context,
     function: Ptr<Operation>,
@@ -468,6 +476,8 @@ fn translate_verified_kernel(
     })
 }
 
+/// Extract the numeric index from a `mir.field_index` or enum-variant attribute
+/// named `key_name` on `attrs`.
 fn attribute_field_index(attrs: &AttributeDict, key_name: &str) -> Option<u32> {
     let text = attrs
         .0
@@ -482,6 +492,8 @@ fn attribute_field_index(attrs: &AttributeDict, key_name: &str) -> Option<u32> {
         .ok()
 }
 
+/// Compute the dominating `< param.len()` guard parameter index for `block_idx`
+/// when every incoming CFG edge into `block_idx` carries the exact same guard.
 fn compute_block_guard(
     block_idx: usize,
     edge_guards: &HashMap<(usize, usize), Option<usize>>,
@@ -501,6 +513,9 @@ fn compute_block_guard(
     }
 }
 
+/// Walk the operations of a single basic block in a 1D verified kernel, updating
+/// [`SsaEnv`], outgoing CFG edge guards, and (on the final pass) recording
+/// guarded buffer accesses and proven `mir.assert` nodes.
 #[allow(clippy::too_many_arguments)]
 fn translate_kernel_block_ops(
     ctx: &Context,
@@ -523,6 +538,16 @@ fn translate_kernel_block_ops(
         let op = op_ptr.deref(ctx);
         match opid.as_str() {
             "mir.storage_live" | "mir.storage_dead" | "mir.dbg_value" | "mir.dbg_declare" => {}
+            "mir.float_constant" => {
+                if op.get_num_results() == 1 {
+                    env.bind_result(op.get_result(0), SsaKind::DataValue);
+                }
+            }
+            _ if opid.starts_with("nvvm.shfl_sync_") => {
+                if op.get_num_results() == 1 {
+                    env.bind_result(op.get_result(0), SsaKind::DataValue);
+                }
+            }
             "mir.alloca" => {
                 if op.get_num_results() == 1 {
                     env.bind_result(op.get_result(0), SsaKind::LaunchContextAlloca);
@@ -540,6 +565,10 @@ fn translate_kernel_block_ops(
                 let callee = get_string_attr(&op.attributes, "callee").unwrap_or_default();
                 if callee.contains("index_1d") && op.get_num_results() == 1 {
                     env.bind_result(op.get_result(0), SsaKind::ThreadIndexStruct);
+                } else if (callee.contains("warp__reduce_") || callee.contains("warp__shuffle_"))
+                    && op.get_num_results() == 1
+                {
+                    env.bind_result(op.get_result(0), SsaKind::DataValue);
                 } else {
                     return Err(reject(
                         "mir.call",
@@ -1020,14 +1049,17 @@ fn translate_verified_2d_tiled_kernel(
     //      because either there is no barrier between write and read, or the read wraps around
     //      the loop backedge into the next iteration's write without a barrier!
     let mut barriers_uniform = !barrier_blocks.is_empty();
+    let mut enclosing_loop_header = None;
     if let Some(&first_barrier) = barrier_blocks.first() {
         // Find the loop header that controls the barrier loop (a block that reaches
         // `first_barrier` and is also reachable from `first_barrier`).
         let loop_header = (0..num_blocks).find(|&h| {
-            can_reach(h, first_barrier, &succs, num_blocks)
+            h != first_barrier
+                && can_reach(h, first_barrier, &succs, num_blocks)
                 && can_reach(first_barrier, h, &succs, num_blocks)
                 && !can_reach_without(0, first_barrier, h, &succs, num_blocks)
         });
+        enclosing_loop_header = loop_header;
         if let Some(header) = loop_header {
             // Condition A: Entry block 0 must not be able to reach any `mir.return`
             // without passing through `header` (catches early `if row >= m { return; }`).
@@ -1059,17 +1091,34 @@ fn translate_verified_2d_tiled_kernel(
         }
     }
 
-    let block_phase = |b_idx: usize| -> usize {
-        if barrier_blocks.len() >= 2 && barriers_uniform {
-            let b0 = barrier_blocks[0];
-            let b1 = barrier_blocks[1];
-            // A block is in Phase 1 if it is reachable from `b0` without crossing `b1`
-            // and is not `b0` itself (unless after the barrier op).
-            if b_idx != b0 && can_reach_without(b0, b_idx, b1, &succs, num_blocks) {
+    let block_phase = |b_idx: usize, after_barrier_in_block: bool| -> usize {
+        if !barriers_uniform || barrier_blocks.is_empty() {
+            return 0;
+        }
+        let b0 = barrier_blocks[0];
+        if enclosing_loop_header.is_some() {
+            if barrier_blocks.len() >= 2 {
+                let b1 = barrier_blocks[1];
+                if b_idx == b0 {
+                    return usize::from(after_barrier_in_block);
+                }
+                if can_reach_without(b0, b_idx, b1, &succs, num_blocks) {
+                    return 1;
+                }
+            }
+            0
+        } else {
+            // Acyclic 1-barrier kernel (`Phase 0 -> sync_threads() -> Phase 1`):
+            if b_idx == b0 {
+                return usize::from(after_barrier_in_block);
+            }
+            if can_reach(b0, b_idx, &succs, num_blocks)
+                && !can_reach_without(0, b_idx, b0, &succs, num_blocks)
+            {
                 return 1;
             }
+            0
         }
-        0
     };
 
     // 4. Fixed-point SSA propagation over the function blocks.
@@ -1103,8 +1152,7 @@ fn translate_verified_2d_tiled_kernel(
                 }
             }
             // Detect inner scan loop counter `i < bound` on block arguments.
-            if block.get_num_arguments() >= 2 {
-                let step_arg = block.get_argument(1);
+            for step_arg in block.arguments() {
                 for op_ptr in block.iter(ctx) {
                     if Operation::get_opid(op_ptr, ctx).to_string() == "mir.lt" {
                         let op = op_ptr.deref(ctx);
@@ -1133,6 +1181,149 @@ fn translate_verified_2d_tiled_kernel(
                     }
                     "nvvm.read_ptx_sreg_tid_y" => {
                         update(&mut env, op.get_result(0), SsaKind::TidY);
+                    }
+                    "nvvm.read_ptx_sreg_laneid" => {
+                        update(
+                            &mut env,
+                            op.get_result(0),
+                            SsaKind::GroupLaneRem { group_size: 32 },
+                        );
+                    }
+                    "mir.call" => {
+                        let callee = get_string_attr(&op.attributes, "callee").unwrap_or_default();
+                        if callee.contains("lane_id") && op.get_num_results() == 1 {
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::GroupLaneRem { group_size: 32 },
+                            );
+                        } else if op.get_num_results() == 1 {
+                            update(&mut env, op.get_result(0), SsaKind::DataValue);
+                        }
+                    }
+                    "mir.div" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: g, .. }))
+                                if g > 0 =>
+                            {
+                                SsaKind::TileCoord2D {
+                                    pattern: TileAccessPatternKind::GroupSlot {
+                                        group_size: u64::try_from(g).unwrap_or(u64::MAX),
+                                    },
+                                    loop_bound: 1,
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.shr" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: sh, .. }))
+                                if sh < 16 =>
+                            {
+                                SsaKind::TileCoord2D {
+                                    pattern: TileAccessPatternKind::GroupSlot {
+                                        group_size: 1u64 << sh,
+                                    },
+                                    loop_bound: 1,
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.rem" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: g, .. }))
+                                if g > 0 =>
+                            {
+                                SsaKind::GroupLaneRem {
+                                    group_size: u64::try_from(g).unwrap_or(u64::MAX),
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.bitand" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: m, .. }))
+                            | (Some(SsaKind::ConstInt { value: m, .. }), Some(SsaKind::TidX))
+                                if m > 0 && (m + 1).is_power_of_two() =>
+                            {
+                                SsaKind::GroupLaneRem {
+                                    group_size: u64::try_from(m + 1).unwrap_or(u64::MAX),
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.eq" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (
+                                Some(SsaKind::GroupLaneRem { group_size }),
+                                Some(SsaKind::ConstInt { value: 0, .. }),
+                            )
+                            | (
+                                Some(SsaKind::ConstInt { value: 0, .. }),
+                                Some(SsaKind::GroupLaneRem { group_size }),
+                            ) => SsaKind::IsGroupLeader { group_size },
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: 0, .. }))
+                            | (Some(SsaKind::ConstInt { value: 0, .. }), Some(SsaKind::TidX)) => {
+                                SsaKind::IsGroupLeader {
+                                    group_size: u64::from(spec.block_size),
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.ne" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = match (lhs, rhs) {
+                            (
+                                Some(SsaKind::GroupLaneRem { group_size }),
+                                Some(SsaKind::ConstInt { value: 0, .. }),
+                            )
+                            | (
+                                Some(SsaKind::ConstInt { value: 0, .. }),
+                                Some(SsaKind::GroupLaneRem { group_size }),
+                            ) => SsaKind::IsNotGroupLeader { group_size },
+                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: 0, .. }))
+                            | (Some(SsaKind::ConstInt { value: 0, .. }), Some(SsaKind::TidX)) => {
+                                SsaKind::IsNotGroupLeader {
+                                    group_size: u64::from(spec.block_size),
+                                }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.not" => {
+                        let inner = env.get_kind(&op.get_operand(0));
+                        let mapped = match inner {
+                            Some(SsaKind::IsGroupLeader { group_size }) => {
+                                SsaKind::IsNotGroupLeader { group_size }
+                            }
+                            Some(SsaKind::IsNotGroupLeader { group_size }) => {
+                                SsaKind::IsGroupLeader { group_size }
+                            }
+                            _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.constant" | "builtin.constant" => {
                         let key = if opid == "mir.constant" {
@@ -1328,6 +1519,14 @@ fn translate_verified_2d_tiled_kernel(
                                 }
                             }
                             (
+                                Some(SsaKind::LoopStep { bound }),
+                                Some(SsaKind::ConstInt { value: size, .. }),
+                            ) => SsaKind::SharedIndexLtLen {
+                                size: u64::try_from(size).unwrap_or(u64::MAX),
+                                pattern: TileAccessPatternKind::LinearScan,
+                                loop_bound: bound,
+                            },
+                            (
                                 Some(SsaKind::StripColOffset | SsaKind::StripColStrided),
                                 Some(SsaKind::SliceLen(guard_param)),
                             ) => SsaKind::IndexLtLen { guard_param },
@@ -1374,6 +1573,21 @@ fn translate_verified_2d_tiled_kernel(
                                 },
                             );
                         } else if let (
+                            Some(SsaKind::SharedBasePtr { shared_id, size }),
+                            Some(SsaKind::LoopStep { bound }),
+                        ) = (base.clone(), idx.clone())
+                        {
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::SharedElementPtr {
+                                    shared_id,
+                                    size,
+                                    pattern: TileAccessPatternKind::LinearScan,
+                                    loop_bound: bound,
+                                },
+                            );
+                        } else if let (
                             Some(SsaKind::SlicePtr(param)),
                             Some(SsaKind::StripColOffset),
                         ) = (base.clone(), idx.clone())
@@ -1416,6 +1630,42 @@ fn translate_verified_2d_tiled_kernel(
         }
     }
 
+    // 4b. Identify blocks dominated by a group-leader branch (`if lane == 0` /
+    //     `if tid % group_size == 0` / `if tid == 0`).
+    let mut leader_branch_pairs: Vec<(usize, usize)> = Vec::new();
+    for &b_ptr in &blocks {
+        for op_ptr in b_ptr.deref(ctx).iter(ctx) {
+            if Operation::get_opid(op_ptr, ctx).to_string() == "mir.cond_br" {
+                let op = op_ptr.deref(ctx);
+                if op.get_num_operands() >= 1 && op.get_num_successors() == 2 {
+                    let cond_kind = env.get_kind(&op.get_operand(0));
+                    let true_succ = op.get_successor(0);
+                    let false_succ = op.get_successor(1);
+                    if let (Some(t_idx), Some(f_idx)) = (
+                        blocks.iter().position(|&b| b == true_succ),
+                        blocks.iter().position(|&b| b == false_succ),
+                    ) {
+                        match cond_kind {
+                            Some(SsaKind::IsGroupLeader { .. }) => {
+                                leader_branch_pairs.push((t_idx, f_idx));
+                            }
+                            Some(SsaKind::IsNotGroupLeader { .. }) => {
+                                leader_branch_pairs.push((f_idx, t_idx));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let is_leader_only_block = |b_idx: usize| -> bool {
+        leader_branch_pairs.iter().any(|&(leader_dst, other_dst)| {
+            !can_reach_without(0, b_idx, leader_dst, &succs, num_blocks)
+                && can_reach_without(leader_dst, b_idx, other_dst, &succs, num_blocks)
+        })
+    };
+
     // 5. Collect 2D global strip accesses, phased shared-memory accesses, and
     //    proven `mir.assert` nodes (rejecting any verified global slice or
     //    shared-memory `mir.ptr_offset` that did not resolve to a recognized
@@ -1424,9 +1674,15 @@ fn translate_verified_2d_tiled_kernel(
     let mut shared_accesses = Vec::new();
     let mut proven_assert_ops = Vec::new();
     for (b_idx, &b_ptr) in blocks.iter().enumerate() {
-        let phase = block_phase(b_idx);
+        let leader_only = is_leader_only_block(b_idx);
+        let mut seen_barrier_in_block = false;
         for op_ptr in b_ptr.deref(ctx).iter(ctx) {
             let opid = Operation::get_opid(op_ptr, ctx).to_string();
+            if opid == "nvvm.barrier0" {
+                seen_barrier_in_block = true;
+                continue;
+            }
+            let phase = block_phase(b_idx, seen_barrier_in_block);
             let op = op_ptr.deref(ctx);
             match opid.as_str() {
                 "mir.ptr_offset" => {
@@ -1490,6 +1746,7 @@ fn translate_verified_2d_tiled_kernel(
                             phase,
                             pattern,
                             loop_bound,
+                            leader_only,
                         });
                     }
                     Some(SsaKind::GlobalStripElementPtr { param, kind }) => {
@@ -1517,6 +1774,7 @@ fn translate_verified_2d_tiled_kernel(
                             phase,
                             pattern,
                             loop_bound,
+                            leader_only,
                         });
                     }
                 }

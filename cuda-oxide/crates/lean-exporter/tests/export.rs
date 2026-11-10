@@ -21,6 +21,7 @@ use pliron::{
 const FIXTURE: &str = include_str!("../fixtures/arithmetic.mir");
 const VECADD_FIXTURE: &str = include_str!("../fixtures/vecadd.mir");
 const SGEMM_TILED_FIXTURE: &str = include_str!("../fixtures/sgemm_tiled.mir");
+const WARP_REDUCE_FIXTURE: &str = include_str!("../fixtures/warp_reduce.mir");
 
 fn export(source: &str) -> String {
     export_named_source(source, "global_index").expect("valid scalar MIR")
@@ -601,5 +602,49 @@ fn verifies_2d_sgemm_tiled_views_and_rejects_shared_races_oob_and_divergent_barr
         err.to_string()
             .contains("2D global slice pointer offset must use a row-strip"),
         "unexpected error for bad 2D global slice offset: {err}"
+    );
+}
+
+#[test]
+fn verifies_stage3_warp_and_block_reductions_and_rejects_missing_leader_guard() {
+    let lean_dir = lean_exporter::runner::default_lean_package_dir();
+
+    // 1. 1D warp butterfly reduction (`warp_reduce_sum`)
+    let warp_lean = export_named_source(WARP_REDUCE_FIXTURE, "warp_reduce_sum")
+        .expect("valid warp_reduce_sum MIR");
+    assert!(warp_lean.contains("def kernelSummary : CudaOxide.Mir.Kernel.KernelSummary1D 2"));
+    assert!(warp_lean.contains("theorem verify_no_oob_idx_param0"));
+    assert!(warp_lean.contains("theorem verify_disjoint_writes_param1"));
+    assert!(warp_lean.contains("theorem verify_writes_all_elems_param1"));
+    lean_exporter::runner::check_generated_lean(&warp_lean, &lean_dir)
+        .expect("valid warp_reduce_sum MIR must pass Lean 4 verification");
+
+    // 2. 2-phase shared-memory block reduction (`block_reduce_sum`)
+    let block_lean = export_named_source(WARP_REDUCE_FIXTURE, "block_reduce_sum")
+        .expect("valid block_reduce_sum MIR");
+    assert!(block_lean.contains(".groupSlot 32"));
+    assert!(block_lean.contains("leaderOnly := true"));
+    assert!(block_lean.contains(".linearScan"));
+    assert!(block_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_group_slot"));
+    assert!(block_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_linear_scan"));
+    assert!(block_lean.contains("CudaOxide.Proofs.Launch.no_data_race_group_leader_slot"));
+    lean_exporter::runner::check_generated_lean(&block_lean, &lean_dir)
+        .expect("valid block_reduce_sum MIR must pass Lean 4 verification");
+
+    // 3. Negative check: forgetting `if lane == 0` (`mir.goto () [^leader_stage]` unconditionally)
+    // causes all 32 threads in a warp to write `WARP_SUMS[tid / 32]` in Phase 0 (`leaderOnly := false`),
+    // which Lean 4 rejects in `NoDataRace` with a counterexample!
+    let unguarded_leader = WARP_REDUCE_FIXTURE.replace(
+        "mir.cond_br (is_leader) [^leader_stage, ^barrier_sync] [builtin_operand_segment_sizes: builtin.operand_segment_sizes [1, 0, 0]]: <(builtin.integer i1) -> ()>",
+        "mir.goto () [^leader_stage] []: <() -> ()>",
+    );
+    let unguarded_lean = export_named_source(&unguarded_leader, "block_reduce_sum")
+        .expect("exports unguarded group-slot obligation");
+    assert!(!unguarded_lean.contains("leaderOnly := true"));
+    let err = lean_exporter::runner::check_generated_lean(&unguarded_lean, &lean_dir)
+        .expect_err("Lean must reject unguarded `WARP_SUMS[tid / 32]` intra-warp write race");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing `lane == 0` guard: {err}"
     );
 }

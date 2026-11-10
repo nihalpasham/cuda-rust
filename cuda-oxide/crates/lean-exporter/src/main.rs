@@ -3,12 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+
+//! Command-line entry point for inspecting and exporting `dialect-mir` functions
+//! to Lean 4 (`lean-exporter [--inspect] <input.mir> <function>`).
+
 use std::{
     env, fs,
     io::{self, Write},
     process::ExitCode,
 };
 
+/// Parse command-line arguments, translate the requested `dialect-mir` function
+/// to Lean 4, and write the output (with optional `--inspect` MIR header) to stdout.
 fn run() -> Result<(), String> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let inspect = args.first().is_some_and(|arg| arg == "--inspect");
@@ -33,6 +40,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Process entry point that runs [`run`] and maps errors to [`ExitCode::FAILURE`].
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,

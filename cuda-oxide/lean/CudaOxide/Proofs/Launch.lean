@@ -129,7 +129,7 @@ theorem no_data_race_thread_slot {blockDimX blockDimY bufId phase loopBound : Na
         pattern := .threadSlot blockDimX, loopBound := loopBound }
       { kind := kind₂, space := space₂, bufferId := bufId, phase := phase,
         pattern := .threadSlot blockDimX, loopBound := loopBound } := by
-  intro tx₁ ty₁ _i₁ tx₂ ty₂ _i₂ htx₁ _hty₁ _hi₁ htx₂ _hty₂ _hi₂ _hbuf _hphase _hwrite hsame
+  intro tx₁ ty₁ _i₁ tx₂ ty₂ _i₂ htx₁ _hty₁ _hi₁ htx₂ _hty₂ _hi₂ _ha₁ _ha₂ _hbuf _hphase _hwrite hsame
   have hinj := globalIndex_injective htx₁ htx₂ hsame      -- `ty₁ * W + tx₁ = ty₂ * W + tx₂` implies `ty₁ = ty₂ ∧ tx₁ = tx₂`
   exact ⟨hinj.2, hinj.1⟩                                  -- Reorder `ty₁ = ty₂ ∧ tx₁ = tx₂` into `tx₁ = tx₂ ∧ ty₁ = ty₂`
 
@@ -138,7 +138,7 @@ theorem no_data_race_thread_slot {blockDimX blockDimY bufId phase loopBound : Na
 theorem no_data_race_diff_phase {blockDimX blockDimY : Nat}
     {a₁ a₂ : Kernel.PhasedTileAccess} (hsep : a₁.phase ≠ a₂.phase) :
     NoDataRace blockDimX blockDimY a₁ a₂ := by
-  intro _tx₁ _ty₁ _i₁ _tx₂ _ty₂ _i₂ _ _ _ _ _ _ _ hphase _ _ -- Unpack premises including `hphase : a₁.phase = a₂.phase`
+  intro _tx₁ _ty₁ _i₁ _tx₂ _ty₂ _i₂ _ _ _ _ _ _ _ _ _ hphase _ _ -- Unpack premises including `hphase : a₁.phase = a₂.phase`
   exact False.elim (hsep hphase)                          -- Contradiction: `a₁.phase ≠ a₂.phase` vs. `a₁.phase = a₂.phase`
 
 /-- Proves `no_data_race(TILE)` when both accesses only read (`kind = .read`):
@@ -147,10 +147,44 @@ theorem no_data_race_read_only {blockDimX blockDimY : Nat}
     {a₁ a₂ : Kernel.PhasedTileAccess}
     (hr₁ : a₁.kind = .read) (hr₂ : a₂.kind = .read) :
     NoDataRace blockDimX blockDimY a₁ a₂ := by
-  intro _tx₁ _ty₁ _i₁ _tx₂ _ty₂ _i₂ _ _ _ _ _ _ _ _ hwrite _ -- Unpack premises including `hwrite : a₁.kind = .write ∨ a₂.kind = .write`
+  intro _tx₁ _ty₁ _i₁ _tx₂ _ty₂ _i₂ _ _ _ _ _ _ _ _ _ _ hwrite _ -- Unpack premises including `hwrite : a₁.kind = .write ∨ a₂.kind = .write`
   rcases hwrite with hw₁ | hw₂                            -- Split on which access claimed to be `.write`
   · rw [hr₁] at hw₁; contradiction                        -- `.read = .write` is impossible
   · rw [hr₂] at hw₂; contradiction                        -- `.read = .write` is impossible
+
+/-- Two numbers with the same quotient `a / W = b / W` and remainder `0`
+    (`a % W = 0` and `b % W = 0`) are equal. -/
+theorem eq_of_div_eq_of_mod_zero {a b groupSize : Nat}
+    (hmod₁ : a % groupSize = 0) (hmod₂ : b % groupSize = 0)
+    (hdiv : a / groupSize = b / groupSize) : a = b := by
+  have ha := Nat.div_add_mod a groupSize                  -- `groupSize * (a / groupSize) + a % groupSize = a`
+  have hb := Nat.div_add_mod b groupSize                  -- `groupSize * (b / groupSize) + b % groupSize = b`
+  rw [hmod₁, Nat.add_zero] at ha                          -- Simplify `ha` to `groupSize * (a / groupSize) = a`
+  rw [hmod₂, Nat.add_zero, ← hdiv] at hb                  -- Substitute `b % W = 0` and `a / W = b / W` into `hb`
+  exact ha.symm.trans hb                                  -- Chain `a = W * (a / W) = b`
+
+/-- Proves `disjoint_writes(sums)` for warp/group leaders: two 1D threads that
+    both satisfy `idx % groupSize = 0` and write to `idx / groupSize` are the
+    exact same thread. -/
+theorem disjoint_group_writes_1d {blockSize groupSize : Nat} :
+    DisjointGroupWrites blockSize groupSize := by
+  intro block₁ block₂ lane₁ lane₂ hlane₁ hlane₂ hmod₁ hmod₂ hdiv -- Unpack leader guards and `idx₁ / W = idx₂ / W`
+  have hsame := eq_of_div_eq_of_mod_zero hmod₁ hmod₂ hdiv -- Reconstruct `idx₁ = idx₂` from quotient and remainder `0`
+  exact globalIndex_injective hlane₁ hlane₂ hsame         -- Apply injectivity of `globalIndex`
+
+/-- Proves `no_data_race(WARP_SUMS)` for leader-guarded group writes
+    (`if lane == 0 { WARP_SUMS[tid / W] = val }`) in a 1D block (`blockDimY = 1`). -/
+theorem no_data_race_group_leader_slot {blockDimX groupSize bufId phase loopBound : Nat}
+    {kind₁ kind₂ : Kernel.AccessKind} {space₁ space₂ : Kernel.MemorySpace} :
+    NoDataRace blockDimX 1
+      { kind := kind₁, space := space₁, bufferId := bufId, phase := phase,
+        pattern := .groupSlot groupSize, loopBound := loopBound, leaderOnly := true }
+      { kind := kind₂, space := space₂, bufferId := bufId, phase := phase,
+        pattern := .groupSlot groupSize, loopBound := loopBound, leaderOnly := true } := by
+  intro tx₁ ty₁ _i₁ tx₂ ty₂ _i₂ _htx₁ hty₁ _hi₁ _htx₂ hty₂ _hi₂ hact₁ hact₂ _hbuf _hphase _hwrite hsame
+  have htx : tx₁ = tx₂ := eq_of_div_eq_of_mod_zero hact₁ hact₂ hsame -- `tx₁ / W = tx₂ / W` with `tx % W = 0` implies `tx₁ = tx₂`
+  have hty : ty₁ = ty₂ := by omega                        -- `ty₁ < 1` and `ty₂ < 1` implies `ty₁ = 0 = ty₂`
+  exact ⟨htx, hty⟩                                        -- Pair `tx₁ = tx₂` and `ty₁ = ty₂`
 
 /-- Proves `uniform_barriers` when the kernel has at least one barrier and all
     barriers sit outside thread-divergent `if` branches. -/

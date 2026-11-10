@@ -31,10 +31,15 @@ namespace CudaOxide.Mir.Scalar
     unsigned machine-word `width` (`8`, `16`, `32`, or `64`). Each argument
     reference carries a `Fin arity` proof that its index is in range. -/
 inductive Expr (width arity : Nat) where
+  /-- Entry block argument at bounded position `index` (`0 ≤ index < arity`). -/
   | arg (index : Fin arity)
+  /-- Unsigned integer constant literal of `width` bits. -/
   | literal (value : BitVec width)
+  /-- Wrapping `width`-bit integer addition (`mir.add`). -/
   | add (lhs rhs : Expr width arity)
+  /-- Wrapping `width`-bit integer subtraction (`mir.sub`). -/
   | sub (lhs rhs : Expr width arity)
+  /-- Wrapping `width`-bit integer multiplication (`mir.mul`). -/
   | mul (lhs rhs : Expr width arity)
 
 /-- Evaluate a scalar MIR expression with exact wrapping `BitVec` arithmetic. -/
@@ -47,22 +52,27 @@ def Expr.eval {width arity : Nat} (expr : Expr width arity)
   | .sub lhs rhs => lhs.eval inputs - rhs.eval inputs
   | .mul lhs rhs => lhs.eval inputs * rhs.eval inputs
 
+/-- Evaluating an argument reference `.arg index` looks up `inputs index`. -/
 @[simp] theorem eval_arg {width arity : Nat} (index : Fin arity)
     (inputs : Fin arity → BitVec width) :
     (Expr.arg index).eval inputs = inputs index := rfl
 
+/-- Evaluating a constant literal `.literal value` returns `value`. -/
 @[simp] theorem eval_literal {width arity : Nat} (value : BitVec width)
     (inputs : Fin arity → BitVec width) :
     (Expr.literal value).eval inputs = value := rfl
 
+/-- Evaluating `.add lhs rhs` adds the evaluated operands in `BitVec width`. -/
 @[simp] theorem eval_add {width arity : Nat} (lhs rhs : Expr width arity)
     (inputs : Fin arity → BitVec width) :
     (Expr.add lhs rhs).eval inputs = lhs.eval inputs + rhs.eval inputs := rfl
 
+/-- Evaluating `.sub lhs rhs` subtracts the evaluated operands in `BitVec width`. -/
 @[simp] theorem eval_sub {width arity : Nat} (lhs rhs : Expr width arity)
     (inputs : Fin arity → BitVec width) :
     (Expr.sub lhs rhs).eval inputs = lhs.eval inputs - rhs.eval inputs := rfl
 
+/-- Evaluating `.mul lhs rhs` multiplies the evaluated operands in `BitVec width`. -/
 @[simp] theorem eval_mul {width arity : Nat} (lhs rhs : Expr width arity)
     (inputs : Fin arity → BitVec width) :
     (Expr.mul lhs rhs).eval inputs = lhs.eval inputs * rhs.eval inputs := rfl

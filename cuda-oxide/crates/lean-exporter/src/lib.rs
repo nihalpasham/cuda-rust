@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+
 //! Translates `dialect-mir` functions into Lean 4 code using a single typed SSA
 //! environment ([`ssa::SsaEnv`]).
 //!
@@ -64,6 +66,8 @@ pub enum ExportError {
     FunctionNotFound(String),
 }
 
+/// Construct a fail-closed [`ExportError::Rejected`] diagnostic for `scope`.
+/// Used whenever an operation, attribute, or contract violates the verified subset.
 pub(crate) fn reject(scope: &str, detail: impl Into<String>) -> ExportError {
     ExportError::Rejected {
         scope: scope.into(),
@@ -71,7 +75,8 @@ pub(crate) fn reject(scope: &str, detail: impl Into<String>) -> ExportError {
     }
 }
 
-/// Only presentation metadata is ignored; all other attributes must be known.
+/// Validate that `attrs` contains only attributes listed in `permitted` (plus
+/// well-formed `builtin_given_names` presentation metadata).
 pub(crate) fn check_attributes(
     attrs: &AttributeDict,
     permitted: &[&str],
@@ -90,6 +95,8 @@ pub(crate) fn check_attributes(
     Ok(())
 }
 
+/// Look up and downcast a required attribute `name` of type `T` on `attrs`,
+/// returning a fail-closed [`ExportError::Rejected`] error when missing or mistyped.
 pub(crate) fn get_attribute<'a, T: pliron::attribute::Attribute>(
     attrs: &'a AttributeDict,
     name: &str,
@@ -103,6 +110,8 @@ pub(crate) fn get_attribute<'a, T: pliron::attribute::Attribute>(
         .ok_or_else(|| reject(scope, format!("missing or malformed attribute `{name}`")))
 }
 
+/// Extract the `builtin_sym_name` string identifier from `op`.
+/// Rejects operations that lack a valid symbol name attribute.
 pub(crate) fn symbol_name(ctx: &Context, op: Ptr<Operation>) -> Result<String, ExportError> {
     let operation = op.deref(ctx);
     Ok(

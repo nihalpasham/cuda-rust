@@ -48,6 +48,8 @@ pub fn default_lean_package_dir() -> PathBuf {
         .join("lean")
 }
 
+/// Locate the `lake` build tool on `PATH` or inside `~/.elan/bin/lake`.
+/// Returns a fail-closed [`ExportError::Rejected`] error if Lean is not installed.
 fn find_lake_executable() -> Result<PathBuf, ExportError> {
     if let Some(paths) = env::var_os("PATH") {
         for dir in env::split_paths(&paths) {

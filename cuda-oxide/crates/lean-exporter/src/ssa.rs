@@ -45,6 +45,13 @@ pub enum TileAccessPatternKind {
         /// Row stride of the shared tile.
         stride: u64,
     },
+    /// Sub-group / warp slot `tx / group_size` (e.g. `WARP_SUMS[tid / 32]`).
+    GroupSlot {
+        /// Number of threads per group (`32` for a warp, `16` for a half-warp).
+        group_size: u64,
+    },
+    /// Linear 1D scan `i` across loop step `i` (`0 <= i < loop_bound`).
+    LinearScan,
 }
 
 /// 2D global slice strip indexing shape in a tiled 2D kernel (`sgemm_tiled_raw`).
@@ -214,6 +221,21 @@ pub enum SsaKind {
         /// Row-strip (`start + col`) vs. column-strip (`start + row * stride`) pattern.
         kind: GlobalStripKind,
     },
+    /// Remainder `tx % group_size` or `warp::lane_id()` (`group_size = 32`).
+    GroupLaneRem {
+        /// Number of threads in the group.
+        group_size: u64,
+    },
+    /// Boolean test `(tx % group_size) == 0` (`lane == 0`).
+    IsGroupLeader {
+        /// Number of threads in the group.
+        group_size: u64,
+    },
+    /// Boolean negation `(tx % group_size) != 0` (`lane != 0`).
+    IsNotGroupLeader {
+        /// Number of threads in the group.
+        group_size: u64,
+    },
     /// Loaded element or arithmetic value that does not affect indexing.
     DataValue,
 }
@@ -230,7 +252,9 @@ pub struct TypedSsa {
 /// Typed SSA lookup table mapping Pliron [`Value`]s to [`TypedSsa`] bindings.
 #[derive(Clone, Debug, Default)]
 pub struct SsaEnv {
+    /// Map from in-memory Pliron SSA [`Value`] to its [`TypedSsa`] binding.
     bindings: HashMap<Value, TypedSsa>,
+    /// Monotonically increasing counter used to mint fresh `v0`, `v1`, ... names.
     next_var_id: usize,
 }
 

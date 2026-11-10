@@ -51,6 +51,10 @@ fn resolve_verified_example_functions(
             "crates/lean-exporter/fixtures/sgemm_tiled.mir",
             &["sgemm_tiled_views", "sgemm_tiled_raw"],
         ),
+        "verified_warp_reduce" => (
+            "crates/lean-exporter/fixtures/warp_reduce.mir",
+            &["warp_reduce_sum", "block_reduce_sum"],
+        ),
         _ => {
             return Err(format!(
                 "no PostMem2Reg MIR fixture registered for verified example `{example_name}`"

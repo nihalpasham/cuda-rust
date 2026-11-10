@@ -77,6 +77,8 @@ pub fn has_verification_attributes(ctx: &Context, function: Ptr<Operation>) -> b
     })
 }
 
+/// Look up an optional [`StringAttr`] named `name` on `attrs` and return its
+/// owned `String` value when present.
 pub(crate) fn get_string_attr(attrs: &AttributeDict, name: &str) -> Option<String> {
     attrs
         .0
@@ -86,6 +88,8 @@ pub(crate) fn get_string_attr(attrs: &AttributeDict, name: &str) -> Option<Strin
         .map(|s| String::from(s.clone()))
 }
 
+/// Look up an optional [`IntegerAttr`] named `name` on `attrs` and convert its
+/// unsigned integer value to `u32`.
 pub(crate) fn get_u32_attr(attrs: &AttributeDict, name: &str) -> Option<u32> {
     attrs
         .0
@@ -95,6 +99,8 @@ pub(crate) fn get_u32_attr(attrs: &AttributeDict, name: &str) -> Option<u32> {
         .and_then(|int| u32::try_from(int.value().to_u64()).ok())
 }
 
+/// Parse a comma-separated list of parameter or shared-array indices (such as
+/// `"0,1,2"`) and validate that every index is strictly below `arity`.
 fn parse_param_list(raw: &str, arity: usize, attr_name: &str) -> Result<Vec<usize>, ExportError> {
     let mut indices = Vec::new();
     for part in raw.split(',') {
@@ -121,6 +127,8 @@ fn parse_param_list(raw: &str, arity: usize, attr_name: &str) -> Result<Vec<usiz
     Ok(indices)
 }
 
+/// Parse a comma-separated list of `<lhs>>=<rhs>` parameter length relations from
+/// `contract_requires_len_ge` and validate that every index is `< arity`.
 fn parse_requires_len_ge(raw: &str, arity: usize) -> Result<BTreeSet<(usize, usize)>, ExportError> {
     let mut pairs = BTreeSet::new();
     for item in raw.split(',') {

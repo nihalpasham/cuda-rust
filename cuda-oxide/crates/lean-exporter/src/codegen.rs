@@ -111,6 +111,8 @@ pub fn proved_obligation_descriptions(
     items
 }
 
+/// Render a verified 1D kernel (`KernelSummary1D`) and its `NoOobIdx`,
+/// `DisjointWrites`, and `WritesAllElems` theorem obligations into Lean 4.
 fn render_verified_kernel_module(
     arity: usize,
     spec: &KernelVerificationSpec,
@@ -266,26 +268,40 @@ fn render_verified_kernel_module(
     ))
 }
 
+/// Format a [`TileAccessPatternKind`] into its corresponding Lean
+/// `CudaOxide.Mir.Kernel.TileAccessPattern` constructor expression.
 fn format_tile_pattern(pat: TileAccessPatternKind) -> String {
     match pat {
         TileAccessPatternKind::ThreadSlot { stride } => format!(".threadSlot {stride}"),
         TileAccessPatternKind::RowScan { stride } => format!(".rowScan {stride}"),
         TileAccessPatternKind::ColScan { stride } => format!(".colScan {stride}"),
+        TileAccessPatternKind::GroupSlot { group_size } => format!(".groupSlot {group_size}"),
+        TileAccessPatternKind::LinearScan => ".linearScan".to_string(),
     }
 }
 
+/// Format a [`PhasedSharedAccess`] into a Lean `CudaOxide.Mir.Kernel.PhasedTileAccess`
+/// record literal for `kernelSummary` and `NoDataRace` theorem statements.
 fn format_phased_access(a: &PhasedSharedAccess) -> String {
     let kind = match a.kind {
         AccessKind::Read => ".read",
         AccessKind::Write => ".write",
     };
     let pat = format_tile_pattern(a.pattern);
+    let leader_suffix = if a.leader_only {
+        ", leaderOnly := true"
+    } else {
+        ""
+    };
     format!(
-        "{{ kind := {kind}, space := .shared, bufferId := {}, phase := {}, pattern := {pat}, loopBound := {} }}",
+        "{{ kind := {kind}, space := .shared, bufferId := {}, phase := {}, pattern := {pat}, loopBound := {}{leader_suffix} }}",
         a.shared_id, a.phase, a.loop_bound
     )
 }
 
+/// Render a phased shared-memory or 2D tiled kernel (`TiledKernelSummary2D`)
+/// and its `NoOobRowStrip`, `NoOobColStrip`, `NoOobTileAccess`, `NoDataRace`,
+/// and `UniformBarriers` theorem obligations into Lean 4.
 fn render_verified_tiled_2d_module(
     spec: &KernelVerificationSpec,
     num_barriers: usize,
@@ -374,6 +390,15 @@ fn render_verified_tiled_2d_module(
                 {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_col_scan (by decide)".to_string()
                 }
+                TileAccessPatternKind::GroupSlot { group_size }
+                    if group_size > 0 && bx.saturating_sub(1) / group_size < buf_len =>
+                {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_group_slot (by decide) (by decide)"
+                        .to_string()
+                }
+                TileAccessPatternKind::LinearScan if loop_bound <= buf_len => {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_linear_scan (by decide)".to_string()
+                }
                 _ => {
                     "intro tx ty i htx hty hi\n  simp [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.globalIndex]\n  omega"
                         .to_string()
@@ -414,11 +439,21 @@ fn render_verified_tiled_2d_module(
                 } else if a1.pattern == (TileAccessPatternKind::ThreadSlot { stride: bx })
                     && a2.pattern == (TileAccessPatternKind::ThreadSlot { stride: bx })
                     && a1.loop_bound == a2.loop_bound
+                    && !a1.leader_only
+                    && !a2.leader_only
                 {
                     "exact CudaOxide.Proofs.Launch.no_data_race_thread_slot".to_string()
+                } else if by == 1
+                    && a1.leader_only
+                    && a2.leader_only
+                    && a1.loop_bound == a2.loop_bound
+                    && matches!(a1.pattern, TileAccessPatternKind::GroupSlot { .. })
+                    && a1.pattern == a2.pattern
+                {
+                    "exact CudaOxide.Proofs.Launch.no_data_race_group_leader_slot".to_string()
                 } else {
-                    "intro tx₁ ty₁ i₁ tx₂ ty₂ i₂ htx₁ hty₁ hi₁ htx₂ hty₂ hi₂ _ _ _ hsame\n  \
-                     simp [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.globalIndex] at hsame\n  \
+                    "intro tx₁ ty₁ i₁ tx₂ ty₂ i₂ htx₁ hty₁ hi₁ htx₂ hty₂ hi₂ hact₁ hact₂ _ _ _ hsame\n  \
+                     simp [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.Kernel.PhasedTileAccess.active, CudaOxide.Mir.globalIndex] at hact₁ hact₂ hsame\n  \
                      omega"
                         .to_string()
                 };

@@ -79,4 +79,34 @@ theorem no_oob_col_strip {bufferLen : Nat} :
   have _hmul := Nat.mul_le_mul_right stride hle           -- Step 2: Multiply both sides by `stride`
   omega                                                   -- Step 3: Linear solver combines with `_hlast`
 
+/-- Proves `no_oob_idx(WARP_SUMS)` for a group-slot access `WARP_SUMS[tx / groupSize]`:
+    in-bounds when `tx < blockDimX` and `(blockDimX - 1) / groupSize < bufferLen`. -/
+theorem no_oob_tile_group_slot {blockDimX blockDimY loopBound groupSize bufferLen : Nat}
+    (hpos : 0 < groupSize) (hfit : (blockDimX - 1) / groupSize < bufferLen) :
+    NoOobTileAccess blockDimX blockDimY loopBound (.groupSlot groupSize) bufferLen := by
+  intro tx _ty _i htx _hty _hi                            -- Unpack `tx < blockDimX`
+  simp only [TileAccessPattern.address]                   -- Unfold `.groupSlot groupSize` address to `tx / groupSize`
+  have hle : tx ≤ blockDimX - 1 := by omega               -- `tx < blockDimX` implies `tx ≤ blockDimX - 1`
+  have hdiv : tx / groupSize ≤ (blockDimX - 1) / groupSize :=
+    Nat.div_le_div_right hle                              -- Division by `groupSize` is monotone (`tx / W ≤ (B - 1) / W`)
+  exact Nat.lt_of_le_of_lt hdiv hfit                      -- Chain with `(blockDimX - 1) / groupSize < bufferLen`
+
+/-- Proves `no_oob_idx(WARP_SUMS)` for a linear scan `WARP_SUMS[i]`:
+    in-bounds when loop step `i < loopBound` and `loopBound ≤ bufferLen`. -/
+theorem no_oob_tile_linear_scan {blockDimX blockDimY loopBound bufferLen : Nat}
+    (hfit : loopBound ≤ bufferLen) :
+    NoOobTileAccess blockDimX blockDimY loopBound .linearScan bufferLen := by
+  intro _tx _ty i _htx _hty hi                            -- Unpack loop bound `i < loopBound`
+  exact Nat.lt_of_lt_of_le hi hfit                        -- Chain `i < loopBound` with `loopBound ≤ bufferLen`
+
+/-- Proves `no_oob_idx(data)` when the kernel checks `idx / groupSize < guardLen`
+    and the launch contract guarantees `guardLen * groupSize ≤ bufferLen`. -/
+theorem no_oob_idx_of_div_guard_le {blockSize groupSize guardLen bufferLen : Nat}
+    (hpos : 0 < groupSize) (hfit : guardLen * groupSize ≤ bufferLen) :
+    NoOobScaledGuard blockSize groupSize guardLen bufferLen := by
+  intro block lane hdiv                                   -- Unpack `idx / groupSize < guardLen`
+  have hlt : CudaOxide.Mir.globalIndex blockSize block lane < guardLen * groupSize :=
+    (Nat.div_lt_iff_lt_mul hpos).1 hdiv                   -- Rewrite `idx / W < guardLen` as `idx < guardLen * W`
+  exact Nat.lt_of_lt_of_le hlt hfit                       -- Chain with `guardLen * groupSize ≤ bufferLen`
+
 end CudaOxide.Proofs.Bounds

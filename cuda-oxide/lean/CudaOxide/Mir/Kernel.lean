@@ -66,7 +66,7 @@ inductive MemorySpace where
   | shared
   deriving Repr, DecidableEq
 
-/-- 2D shared-memory tile indexing pattern inside a `(blockDimX, blockDimY, 1)` block. -/
+/-- Shared-memory tile or reduction indexing pattern inside a `(blockDimX, blockDimY, 1)` block. -/
 inductive TileAccessPattern where
   /-- Unique per-thread staging slot `ty * stride + tx`. -/
   | threadSlot (stride : Nat)
@@ -74,14 +74,20 @@ inductive TileAccessPattern where
   | rowScan (stride : Nat)
   /-- Column scan `i * stride + tx` down loop index `i`. -/
   | colScan (stride : Nat)
+  /-- Sub-group / warp slot `tx / groupSize` (e.g. `WARP_SUMS[tid / 32]`). -/
+  | groupSlot (groupSize : Nat)
+  /-- Linear scan `i` across loop index `i` (e.g. `WARP_SUMS[i]`). -/
+  | linearScan
   deriving Repr, DecidableEq
 
-/-- Evaluate the flat element index of a 2D tile access for thread `(tx, ty)` at step `i`. -/
+/-- Evaluate the flat element index of a shared-memory access for thread `(tx, ty)` at step `i`. -/
 def TileAccessPattern.address (pat : TileAccessPattern) (tx ty i : Nat) : Nat :=
   match pat with
   | .threadSlot stride => CudaOxide.Mir.globalIndex stride ty tx
   | .rowScan stride => CudaOxide.Mir.globalIndex stride ty i
   | .colScan stride => CudaOxide.Mir.globalIndex stride i tx
+  | .groupSlot groupSize => tx / groupSize
+  | .linearScan => i
 
 /-- A shared-memory tile access tagged with its barrier phase (`0`, `1`, ...). -/
 structure PhasedTileAccess where
@@ -93,11 +99,22 @@ structure PhasedTileAccess where
   bufferId : Nat
   /-- Barrier phase index (`0` before first `sync_threads()`, `1` after first, etc.). -/
   phase : Nat
-  /-- 2D coordinate formula used to index the buffer. -/
+  /-- Coordinate formula used to index the buffer. -/
   pattern : TileAccessPattern
   /-- Exclusive upper bound on loop index `i` (`1` if not inside an inner scan loop). -/
   loopBound : Nat := 1
+  /-- True when guarded by a leader check (`tx % groupSize = 0` or `tx = 0`). -/
+  leaderOnly : Bool := false
   deriving Repr, DecidableEq
+
+/-- Predicate describing which threads `tx` execute `a` (all threads when
+    `leaderOnly = false`; only group leaders `tx % groupSize = 0` or `tx = 0`
+    when `leaderOnly = true`). -/
+def PhasedTileAccess.active (a : PhasedTileAccess) (tx : Nat) : Prop :=
+  match a.leaderOnly, a.pattern with
+  | true, .groupSlot groupSize => tx % groupSize = 0
+  | true, _ => tx = 0
+  | false, _ => True
 
 /-- Summary of a 2D phased shared-memory kernel extracted at `PostMem2Reg`. -/
 structure TiledKernelSummary2D where

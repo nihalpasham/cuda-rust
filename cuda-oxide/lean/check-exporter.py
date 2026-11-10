@@ -15,6 +15,7 @@ REPO = ROOT.parent
 SCALAR_FIXTURE = REPO / "crates/lean-exporter/fixtures/arithmetic.mir"
 VECADD_FIXTURE = REPO / "crates/lean-exporter/fixtures/vecadd.mir"
 SGEMM_TILED_FIXTURE = REPO / "crates/lean-exporter/fixtures/sgemm_tiled.mir"
+WARP_REDUCE_FIXTURE = REPO / "crates/lean-exporter/fixtures/warp_reduce.mir"
 PROOFS = """
 namespace CudaOxide.Generated
 
@@ -180,7 +181,40 @@ def main():
             raise RuntimeError(f"Expected non-strip 2D global slice access to be rejected:\n{rejected_strip.stderr}")
         print("REJECTED as expected: non-strip 2D global slice access is rejected before Lean.", flush=True)
 
-    print("Exporter checks passed for scalar, 1D vecadd, and 2D phased shared-memory SGEMM fixtures.")
+        # Stage 3: Verified warp & 2-phase block reductions
+        warp_source = WARP_REDUCE_FIXTURE.read_text()
+        warp_lean = require_export(WARP_REDUCE_FIXTURE, "warp_reduce_sum")
+        warp_valid = temporary / "WarpReduceValid.lean"
+        warp_valid.write_text(warp_lean)
+        require_success("env", "lean", str(warp_valid))
+        print("PASS: exported warp_reduce_sum MIR proves 1D warp butterfly reduction obligations.", flush=True)
+
+        block_lean = require_export(WARP_REDUCE_FIXTURE, "block_reduce_sum")
+        block_valid = temporary / "BlockReduceValid.lean"
+        block_valid.write_text(block_lean)
+        require_success("env", "lean", str(block_valid))
+        print("PASS: exported block_reduce_sum MIR proves leader-guarded WARP_SUMS[tid / 32] and Phase 1 scan.", flush=True)
+
+        # Mutate block_reduce_sum MIR by removing the `if lane == 0` guard:
+        no_leader_mir = temporary / "block_reduce_no_leader.mir"
+        no_leader_mir.write_text(
+            warp_source.replace(
+                "mir.cond_br (is_leader) [^leader_stage, ^barrier_sync] [builtin_operand_segment_sizes: builtin.operand_segment_sizes [1, 0, 0]]: <(builtin.integer i1) -> ()>",
+                "mir.goto () [^leader_stage] []: <() -> ()>",
+                1,
+            )
+        )
+        no_leader_lean = require_export(no_leader_mir, "block_reduce_sum")
+        no_leader_file = temporary / "BlockReduceNoLeader.lean"
+        no_leader_file.write_text(
+            "\n".join(line for line in no_leader_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_no_leader = run_lake("env", "lean", str(no_leader_file))
+        if res_no_leader.returncode == 0 or "error: omega could not prove the goal:" not in res_no_leader.stdout:
+            raise RuntimeError(f"Expected missing `lane == 0` guard to fail NoDataRace in Lean:\n{res_no_leader.stdout}")
+        print("REJECTED as expected: missing `lane == 0` guard before `WARP_SUMS[tid / 32]` fails `no_data_race`.", flush=True)
+
+    print("Exporter checks passed for scalar, 1D vecadd, 2D SGEMM, and Stage 3 warp/block reduction fixtures.")
 
 
 if __name__ == "__main__":

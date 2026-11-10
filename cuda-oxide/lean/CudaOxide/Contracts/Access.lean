@@ -68,19 +68,41 @@ def NoOobTileAccess (blockDimX blockDimY loopBound : Nat)
     pat.address tx ty i < bufferLen                       -- THEN the tile index is strictly `< bufferLen`.
 
 /-- **`no_data_race(buf)`**: Two accesses `a₁` and `a₂` on the same buffer never
-    cause a write-write or read-write conflict between distinct threads in the
-    same barrier phase. -/
+    cause a write-write or read-write conflict between distinct active threads in
+    the same barrier phase. -/
 def NoDataRace (blockDimX blockDimY : Nat)
     (a₁ a₂ : PhasedTileAccess) : Prop :=
   ∀ tx₁ ty₁ i₁ tx₂ ty₂ i₂ : Nat,                            -- Pick ANY two threads (tx₁, ty₁), (tx₂, ty₂) and steps i₁, i₂:
     tx₁ < blockDimX → ty₁ < blockDimY → i₁ < a₁.loopBound → -- IF thread 1 and step i₁ are within bounds,
     tx₂ < blockDimX → ty₂ < blockDimY → i₂ < a₂.loopBound → -- AND thread 2 and step i₂ are within bounds,
+    a₁.active tx₁ → a₂.active tx₂ →                         -- AND both threads satisfy their access guard (e.g. `lane == 0`),
     a₁.bufferId = a₂.bufferId →                             -- AND both accesses target the same buffer,
     a₁.phase = a₂.phase →                                   -- AND both accesses execute in the SAME barrier phase,
     (a₁.kind = .write ∨ a₂.kind = .write) →                 -- AND at least one of the accesses is a write,
     a₁.pattern.address tx₁ ty₁ i₁ =                         -- AND both threads compute the exact same
       a₂.pattern.address tx₂ ty₂ i₂ →                       --     element address in that buffer,
     tx₁ = tx₂ ∧ ty₁ = ty₂                                   -- THEN they must be the exact same thread (`∧` = AND).
+
+/-- **`disjoint_writes(buf)` (warp / sub-group leader)**: Distinct 1D threads
+    `(block₁, lane₁)` and `(block₂, lane₂)` that both pass the group-leader
+    guard `idx % groupSize = 0` never write to the same group slot `idx / groupSize`. -/
+def DisjointGroupWrites (blockSize groupSize : Nat) : Prop :=
+  ∀ block₁ block₂ lane₁ lane₂ : Nat,                      -- Pick ANY two threads (block₁, lane₁) and (block₂, lane₂):
+    lane₁ < blockSize →                                   -- IF thread 1's lane is valid,
+    lane₂ < blockSize →                                   -- AND thread 2's lane is valid,
+    globalIndex blockSize block₁ lane₁ % groupSize = 0 →  -- AND thread 1 is its group's leader (`idx₁ % W = 0`),
+    globalIndex blockSize block₂ lane₂ % groupSize = 0 →  -- AND thread 2 is its group's leader (`idx₂ % W = 0`),
+    globalIndex blockSize block₁ lane₁ / groupSize =      -- AND both leaders write to the exact same
+      globalIndex blockSize block₂ lane₂ / groupSize →    --     group slot (`idx₁ / W = idx₂ / W`),
+    block₁ = block₂ ∧ lane₁ = lane₂                       -- THEN they are the exact same thread (`∧` = AND).
+
+/-- **`no_oob_idx(buf)` (group-scaled guard)**: Every 1D thread `(block, lane)`
+    whose group index `idx / groupSize < guardLen` indexes `buf[idx]` strictly
+    below `bufferLen` when `guardLen * groupSize ≤ bufferLen`. -/
+def NoOobScaledGuard (blockSize groupSize guardLen bufferLen : Nat) : Prop :=
+  ∀ block lane : Nat,                                     -- Pick ANY thread (block, lane):
+    globalIndex blockSize block lane / groupSize < guardLen → -- IF its group slot is `< guardLen`,
+    globalIndex blockSize block lane < bufferLen          -- THEN its element index `idx` is `< bufferLen`.
 
 /-- **`uniform_barriers`**: All `sync_threads()` barriers in the kernel execute
     in thread-uniform control flow. -/
