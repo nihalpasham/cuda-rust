@@ -186,6 +186,74 @@ theorem no_data_race_group_leader_slot {blockDimX groupSize bufId phase loopBoun
   have hty : ty₁ = ty₂ := by omega                        -- `ty₁ < 1` and `ty₂ < 1` implies `ty₁ = 0 = ty₂`
   exact ⟨htx, hty⟩                                        -- Pair `tx₁ = tx₂` and `ty₁ = ty₂`
 
+/-- Bit-split / Euclidean identity: `(a / W) * W + (a % W) = a`. -/
+theorem bit_split_reconstruct (a groupSize : Nat) :
+    globalIndex groupSize (a / groupSize) (a % groupSize) = a := by
+  simpa [globalIndex, Nat.mul_comm] using Nat.div_add_mod a groupSize -- `W * (a / W) + a % W = a`
+
+/-- Two numbers with the same quotient `a / W = b / W` and remainder `a % W = b % W`
+    are equal. -/
+theorem eq_of_div_eq_of_mod_eq {a b groupSize : Nat}
+    (hdiv : a / groupSize = b / groupSize)
+    (hmod : a % groupSize = b % groupSize) : a = b := by
+  have ha := bit_split_reconstruct a groupSize            -- `(a / W) * W + (a % W) = a`
+  have hb := bit_split_reconstruct b groupSize            -- `(b / W) * W + (b % W) = b`
+  rw [hdiv, hmod] at ha                                   -- Rewrite `a / W` and `a % W` to `b / W` and `b % W`
+  exact ha.symm.trans hb                                  -- Conclude `a = b`
+
+/-- Proves `no_data_race(TILE)` for packed per-thread writes `TILE[tx * pack + i]`
+    in a 1D block (`blockDimY = 1`) when `loopBound₁ ≤ pack` and `loopBound₂ ≤ pack`:
+    distinct threads `tx₁ ≠ tx₂` own disjoint `pack`-element segments. -/
+theorem no_data_race_packed_slot {blockDimX pack bufId phase loopBound₁ loopBound₂ : Nat}
+    {kind₁ kind₂ : Kernel.AccessKind} {space₁ space₂ : Kernel.MemorySpace}
+    (hloop₁ : loopBound₁ ≤ pack) (hloop₂ : loopBound₂ ≤ pack) :
+    NoDataRace blockDimX 1
+      { kind := kind₁, space := space₁, bufferId := bufId, phase := phase,
+        pattern := .packedSlot pack, loopBound := loopBound₁ }
+      { kind := kind₂, space := space₂, bufferId := bufId, phase := phase,
+        pattern := .packedSlot pack, loopBound := loopBound₂ } := by
+  intro tx₁ ty₁ i₁ tx₂ ty₂ i₂ _htx₁ hty₁ hi₁ _htx₂ hty₂ hi₂ _ha₁ _ha₂ _hbuf _hphase _hwrite hsame
+  have hi₁_pack : i₁ < pack := Nat.lt_of_lt_of_le hi₁ hloop₁ -- `i₁ < loopBound₁ ≤ pack`
+  have hi₂_pack : i₂ < pack := Nat.lt_of_lt_of_le hi₂ hloop₂ -- `i₂ < loopBound₂ ≤ pack`
+  have hinj := globalIndex_injective hi₁_pack hi₂_pack hsame -- `tx₁ * pack + i₁ = tx₂ * pack + i₂` implies `tx₁ = tx₂`
+  have hty : ty₁ = ty₂ := by omega                        -- `ty₁ < 1` and `ty₂ < 1` implies `ty₁ = 0 = ty₂`
+  exact ⟨hinj.1, hty⟩                                     -- Pair `tx₁ = tx₂` and `ty₁ = ty₂`
+
+/-- Proves `no_data_race(TILE)` for bit-split 2D writes
+    `TILE[(tx / groupSize) * stride + (tx % groupSize)]` in a 1D block (`blockDimY = 1`)
+    when `0 < groupSize ≤ stride`: every thread `tx` maps to a unique `(row, col)` slot. -/
+theorem no_data_race_bit_split_slot {blockDimX groupSize stride bufId phase loopBound : Nat}
+    {kind₁ kind₂ : Kernel.AccessKind} {space₁ space₂ : Kernel.MemorySpace}
+    (hpos : 0 < groupSize) (hstride : groupSize ≤ stride) :
+    NoDataRace blockDimX 1
+      { kind := kind₁, space := space₁, bufferId := bufId, phase := phase,
+        pattern := .bitSplitSlot groupSize stride, loopBound := loopBound }
+      { kind := kind₂, space := space₂, bufferId := bufId, phase := phase,
+        pattern := .bitSplitSlot groupSize stride, loopBound := loopBound } := by
+  intro tx₁ ty₁ _i₁ tx₂ ty₂ _i₂ _htx₁ hty₁ _hi₁ _htx₂ hty₂ _hi₂ _ha₁ _ha₂ _hbuf _hphase _hwrite hsame
+  have hrem₁ : tx₁ % groupSize < stride :=
+    Nat.lt_of_lt_of_le (Nat.mod_lt tx₁ hpos) hstride      -- `tx₁ % W < W ≤ stride`
+  have hrem₂ : tx₂ % groupSize < stride :=
+    Nat.lt_of_lt_of_le (Nat.mod_lt tx₂ hpos) hstride      -- `tx₂ % W < W ≤ stride`
+  have hinj := globalIndex_injective hrem₁ hrem₂ hsame    -- Recover `tx₁ / W = tx₂ / W ∧ tx₁ % W = tx₂ % W`
+  have htx : tx₁ = tx₂ := eq_of_div_eq_of_mod_eq hinj.1 hinj.2 -- Reconstruct `tx₁ = tx₂`
+  have hty : ty₁ = ty₂ := by omega                        -- `ty₁ < 1` and `ty₂ < 1` implies `ty₁ = 0 = ty₂`
+  exact ⟨htx, hty⟩                                        -- Pair `tx₁ = tx₂` and `ty₁ = ty₂`
+
+/-- Proves `no_data_race(TILE)` for an operation issued by a single leader thread
+    (`if tid == 0`, so `leaderOnly = true`) in a 1D block (`blockDimY = 1`),
+    such as an asynchronous bulk copy (`cp.async.bulk`) into `TILE`. -/
+theorem no_data_race_single_leader {blockDimX bufId phase loopBound : Nat}
+    {kind₁ kind₂ : Kernel.AccessKind} {space₁ space₂ : Kernel.MemorySpace} :
+    NoDataRace blockDimX 1
+      { kind := kind₁, space := space₁, bufferId := bufId, phase := phase,
+        pattern := .linearScan, loopBound := loopBound, leaderOnly := true }
+      { kind := kind₂, space := space₂, bufferId := bufId, phase := phase,
+        pattern := .linearScan, loopBound := loopBound, leaderOnly := true } := by
+  intro tx₁ ty₁ _i₁ tx₂ ty₂ _i₂ _htx₁ hty₁ _hi₁ _htx₂ hty₂ _hi₂ hact₁ hact₂ _hbuf _hphase _hwrite _hsame
+  simp only [PhasedTileAccess.active] at hact₁ hact₂      -- Unfold `active` with `leaderOnly = true` to `tx₁ = 0` and `tx₂ = 0`
+  omega                                                   -- `tx₁ = 0 = tx₂` and `ty₁, ty₂ < 1` implies `tx₁ = tx₂ ∧ ty₁ = ty₂`
+
 /-- Proves `uniform_barriers` when the kernel has at least one barrier and all
     barriers sit outside thread-divergent `if` branches. -/
 theorem uniform_barriers_of_checked {numBarriers : Nat}

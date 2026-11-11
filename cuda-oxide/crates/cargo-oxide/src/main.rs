@@ -499,7 +499,7 @@ enum Commands {
     /// Inspect scalar MIR and its generated Lean model (source checkout only)
     #[command(name = "lean-export")]
     LeanExport {
-        /// Verified example name (`verified_vecadd`, `verified_gemm_views`) or MIR file path
+        /// Verified example name (`safe_vecadd`, `safe_gemm_views`) or MIR file path
         #[arg(value_name = "INPUT")]
         input: Option<PathBuf>,
         /// Exact MIR function symbol (required when INPUT is a `.mir` file)
@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(input, Some(PathBuf::from("path with spaces/input.mir")));
         assert_eq!(function.as_deref(), Some("global_index"));
         let by_example =
-            Cli::try_parse_from(["cargo-oxide", "lean-export", "verified_vecadd"]).unwrap();
+            Cli::try_parse_from(["cargo-oxide", "lean-export", "safe_vecadd"]).unwrap();
         assert!(matches!(
             by_example.command,
             Commands::LeanExport {

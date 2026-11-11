@@ -3267,6 +3267,8 @@ fn try_dispatch_intrinsic(
                 | "cuda_device::thread::__launch_contract_block_config" => {
                     "__launch_contract_block_config"
                 }
+                "cuda_device::__grid_constant_config"
+                | "cuda_device::thread::__grid_constant_config" => "__grid_constant_config",
                 "cuda_device::__unchecked_indexing_config"
                 | "cuda_device::thread::__unchecked_indexing_config" => {
                     "__unchecked_indexing_config"

@@ -3,20 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! End-to-end Lean 4 verified vector addition (`c[i] = a[i] + b[i]`).
+//! Provably safe 1D vector addition (`c[i] = a[i] + b[i]`) using Lean 4 safety proofs.
 //!
 //! Build and run with:
-//!   cargo oxide run verified_vecadd
+//!   cargo oxide run safe_vecadd
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, cuda_module, kernel, launch_contract, thread, verify};
 
-/// Verified 1D vector addition module.
+/// Provably safe 1D vector addition module.
 #[cuda_module]
 mod kernels {
     use super::*;
 
-    /// Vector addition kernel verified by Lean 4 at `PostMem2Reg`:
+    /// Provably safe vector addition kernel checked by Lean 4 at `PostMem2Reg`:
     /// - `no_oob_idx(a, b, c)`: every slice access stays within `0..len`
     /// - `disjoint_writes(c)`: distinct 1D threads never write the same slot
     /// - `writes_all_elems(c)`: every element in `0..c.len()` has a writer
@@ -37,7 +37,7 @@ mod kernels {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Lean-Verified Vector Addition ===\n");
+    println!("=== Provably Safe Vector Addition (`safe_vecadd`) ===\n");
     println!("Contract & Lean 4 Proof Summary:");
     println!("  • Launch contract: domain = 1, block = (256, 1, 1)");
     println!("  • Host requires:   a.len() >= c.len(), b.len() >= c.len()");
@@ -58,13 +58,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let b_dev = DeviceBuffer::from_host(&stream, &b_host)?;
     let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N)?;
 
-    // SAFETY: this binary embeds the single `verified_vecadd` PTX module.
+    // SAFETY: this binary embeds the single `safe_vecadd` PTX module.
     let module = unsafe { kernels::load(&ctx)? };
     let blocks = (N as u32).div_ceil(BLOCK_SIZE);
     let launch = module.prepare_vecadd(LaunchConfig1D::new(blocks, BLOCK_SIZE, 0))?;
 
     // Safe, contract-checked launch: enforces `a.len() >= c.len()` and
-    // `b.len() >= c.len()` on the host before launching the Lean-verified PTX.
+    // `b.len() >= c.len()` on the host before launching the provably safe PTX.
     module.vecadd(&stream, &launch, &a_dev, &b_dev, &mut c_dev)?;
 
     let c_host = c_dev.to_host_vec(&stream)?;

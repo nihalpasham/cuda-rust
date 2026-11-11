@@ -3,9 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Verified 2D Tiled SGEMM with Views (`verified_gemm_views`)
+# Provably Safe 2D Tiled SGEMM with Views (`safe_gemm_views`)
 
-Demonstrates how `cuda-oxide` combines **Rust proof-carrying views** (`MatrixView32`, `DisjointSlice`) for global memory with **Lean 4 formal verification** (`#[verify(...)]`) for shared-memory tiles (`TILE_A`, `TILE_B`) and `sync_threads()` barriers:
+Demonstrates how `cuda-oxide` combines **Rust proof-carrying views** (`MatrixView32`, `DisjointSlice`) for global memory with **Lean 4 safety proofs** (`#[verify(...)]`) for shared-memory tiles (`TILE_A`, `TILE_B`) and `sync_threads()` barriers:
 
 ```text
   #[launch_contract(domain = 2, coordinates = u32, block = (16, 16, 1),
@@ -30,7 +30,7 @@ Demonstrates how `cuda-oxide` combines **Rust proof-carrying views** (`MatrixVie
 From the `cuda-oxide/` directory:
 
 ```bash
-cargo oxide run verified_gemm_views
+cargo oxide run safe_gemm_views
 ```
 
 To inspect the exported Lean module and generated theorems directly:

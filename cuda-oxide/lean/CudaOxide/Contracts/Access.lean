@@ -67,6 +67,18 @@ def NoOobTileAccess (blockDimX blockDimY loopBound : Nat)
     i < loopBound →                                       -- AND `i` is within the loop bound,
     pat.address tx ty i < bufferLen                       -- THEN the tile index is strictly `< bufferLen`.
 
+/-- **`no_oob_idx(TILE)` (with branch guard)**: Every 2D thread `(tx, ty)` and
+    loop step `i < loopBound` that satisfies `guard` indexes `TILE` strictly
+    below `bufferLen`. -/
+def NoOobGuardedTileAccess (blockDimX blockDimY loopBound : Nat)
+    (guard : GuardExpr) (pat : TileAccessPattern) (bufferLen : Nat) : Prop :=
+  ∀ tx ty i : Nat,                                        -- Pick ANY 2D thread (tx, ty) and loop step `i`:
+    tx < blockDimX →                                      -- IF `tx` is within the block X dimension,
+    ty < blockDimY →                                      -- AND `ty` is within the block Y dimension,
+    i < loopBound →                                       -- AND `i` is within the loop bound,
+    guard.eval tx ty i →                                  -- AND `(tx, ty, i)` satisfies the branch guard,
+    pat.address tx ty i < bufferLen                       -- THEN the tile index is strictly `< bufferLen`.
+
 /-- **`no_data_race(buf)`**: Two accesses `a₁` and `a₂` on the same buffer never
     cause a write-write or read-write conflict between distinct active threads in
     the same barrier phase. -/

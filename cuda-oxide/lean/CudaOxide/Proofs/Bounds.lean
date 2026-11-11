@@ -99,7 +99,7 @@ theorem no_oob_tile_linear_scan {blockDimX blockDimY loopBound bufferLen : Nat}
   intro _tx _ty i _htx _hty hi                            -- Unpack loop bound `i < loopBound`
   exact Nat.lt_of_lt_of_le hi hfit                        -- Chain `i < loopBound` with `loopBound ≤ bufferLen`
 
-/-- Proves `no_oob_idx(data)` when the kernel checks `idx / groupSize < guardLen`
+/-- Proves `no_oob_idx( data)` when the kernel checks `idx / groupSize < guardLen`
     and the launch contract guarantees `guardLen * groupSize ≤ bufferLen`. -/
 theorem no_oob_idx_of_div_guard_le {blockSize groupSize guardLen bufferLen : Nat}
     (hpos : 0 < groupSize) (hfit : guardLen * groupSize ≤ bufferLen) :
@@ -108,5 +108,54 @@ theorem no_oob_idx_of_div_guard_le {blockSize groupSize guardLen bufferLen : Nat
   have hlt : CudaOxide.Mir.globalIndex blockSize block lane < guardLen * groupSize :=
     (Nat.div_lt_iff_lt_mul hpos).1 hdiv                   -- Rewrite `idx / W < guardLen` as `idx < guardLen * W`
   exact Nat.lt_of_lt_of_le hlt hfit                       -- Chain with `guardLen * groupSize ≤ bufferLen`
+
+/-- Proves `no_oob_idx(TILE)` for a 1D thread slot `TILE[tx]` (`blockDimY = 1`)
+    when active threads satisfy `tx < activeThreads` and `activeThreads ≤ bufferLen`. -/
+theorem no_oob_tile_1d_slot {activeThreads stride loopBound bufferLen : Nat}
+    (hfit : activeThreads ≤ bufferLen) :
+    NoOobTileAccess activeThreads 1 loopBound (.threadSlot stride) bufferLen := by
+  intro tx ty _i htx hty _hi                              -- Unpack `tx < activeThreads` and `ty < 1`
+  have hty0 : ty = 0 := by omega                          -- In a 1D block (`blockDimY = 1`), `ty` is `0`
+  simp [TileAccessPattern.address, CudaOxide.Mir.globalIndex, hty0] -- Simplify `0 * stride + tx` to `tx`
+  exact Nat.lt_of_lt_of_le htx hfit                       -- Chain `tx < activeThreads` with `≤ bufferLen`
+
+/-- Proves `no_oob_idx(TILE)` for packed per-thread accesses `TILE[tx * pack + i]`:
+    in-bounds when `tx < activeThreads`, `i < loopBound ≤ pack`, and
+    `activeThreads * pack ≤ bufferLen`. -/
+theorem no_oob_tile_packed_slot {activeThreads blockDimY loopBound pack bufferLen : Nat}
+    (hloop : loopBound ≤ pack) (hfit : activeThreads * pack ≤ bufferLen) :
+    NoOobTileAccess activeThreads blockDimY loopBound (.packedSlot pack) bufferLen := by
+  intro tx _ty i htx _hty hi                              -- Unpack `tx < activeThreads` and `i < loopBound`
+  have hi_pack : i < pack := Nat.lt_of_lt_of_le hi hloop  -- Chain `i < loopBound` with `loopBound ≤ pack`
+  exact CudaOxide.Proofs.Launch.launched_index_fits htx hi_pack hfit -- `tx * pack + i < activeThreads * pack ≤ bufferLen`
+
+/-- Proves `no_oob_idx(TILE)` for a sub-warp lane scan `TILE[(tx % groupSize) * pack + i]`:
+    in-bounds for any thread `tx` when `0 < groupSize`, `i < loopBound ≤ pack`,
+    and `groupSize * pack ≤ bufferLen`. -/
+theorem no_oob_tile_group_lane_scan {blockDimX blockDimY loopBound groupSize pack bufferLen : Nat}
+    (hpos : 0 < groupSize) (hloop : loopBound ≤ pack)
+    (hfit : groupSize * pack ≤ bufferLen) :
+    NoOobTileAccess blockDimX blockDimY loopBound (.groupLaneScan groupSize pack) bufferLen := by
+  intro tx _ty i _htx _hty hi                             -- Unpack thread `tx` and step `i < loopBound`
+  have hrem : tx % groupSize < groupSize := Nat.mod_lt tx hpos -- `tx % groupSize` is strictly `< groupSize`
+  have hi_pack : i < pack := Nat.lt_of_lt_of_le hi hloop  -- Chain `i < loopBound` with `loopBound ≤ pack`
+  exact CudaOxide.Proofs.Launch.launched_index_fits hrem hi_pack hfit -- `(tx % W) * pack + i < W * pack ≤ bufferLen`
+
+/-- Proves `no_oob_idx(TILE)` for a bit-split 2D slot
+    `TILE[(tx / groupSize) * stride + (tx % groupSize)]`: in-bounds when
+    `0 < groupSize ≤ stride` and all `(activeThreads - 1) / groupSize + 1` rows fit. -/
+theorem no_oob_tile_bit_split_slot {activeThreads blockDimY loopBound groupSize stride bufferLen : Nat}
+    (hpos : 0 < groupSize) (hstride : groupSize ≤ stride)
+    (hfit : ((activeThreads - 1) / groupSize + 1) * stride ≤ bufferLen) :
+    NoOobTileAccess activeThreads blockDimY loopBound (.bitSplitSlot groupSize stride) bufferLen := by
+  intro tx _ty _i htx _hty _hi                            -- Unpack `tx < activeThreads`
+  have hle : tx ≤ activeThreads - 1 := by omega           -- `tx < activeThreads` implies `tx ≤ activeThreads - 1`
+  have hdiv : tx / groupSize < (activeThreads - 1) / groupSize + 1 := by
+    have hm : tx / groupSize ≤ (activeThreads - 1) / groupSize :=
+      Nat.div_le_div_right hle                            -- Monotonicity of `/ groupSize`
+    omega                                                 -- `a ≤ b` implies `a < b + 1`
+  have hrem : tx % groupSize < stride :=
+    Nat.lt_of_lt_of_le (Nat.mod_lt tx hpos) hstride       -- `tx % groupSize < groupSize ≤ stride`
+  exact CudaOxide.Proofs.Launch.launched_index_fits hdiv hrem hfit -- `(tx / W) * stride + (tx % W) < bufferLen`
 
 end CudaOxide.Proofs.Bounds

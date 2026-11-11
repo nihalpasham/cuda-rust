@@ -25,10 +25,18 @@ fn resolve_verified_example_functions(
     example_name: &str,
     explicit_fn: Option<&str>,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    let canonical_name = match example_name {
+        "verified_vecadd" => "safe_vecadd",
+        "verified_gemm_views" => "safe_gemm_views",
+        "verified_warp_reduce" => "safe_warp_reduce",
+        "verified_subwarp_stage" => "safe_subwarp_stage",
+        "verified_async_copy" => "safe_async_copy",
+        other => other,
+    };
     let roots = example_roots(ctx);
     let matches: Vec<_> = roots
         .iter()
-        .map(|root| root.join(example_name))
+        .map(|root| root.join(canonical_name))
         .filter(|path| path.is_dir())
         .collect();
     let example_dir = match matches.as_slice() {
@@ -41,23 +49,31 @@ fn resolve_verified_example_functions(
     let source = fs::read_to_string(&main_rs).unwrap_or_default();
     if !source.contains("#[verify(") {
         return Err(format!(
-            "example `{example_name}` does not use `#[verify(...)]`; only verified examples can be exported with `cargo oxide lean-export <example>`"
+            "example `{example_name}` does not use `#[verify(...)]`; only provably safe examples can be exported with `cargo oxide lean-export <example>`"
         ));
     }
 
-    let (fixture_rel, default_fns): (&str, &[&str]) = match example_name {
-        "verified_vecadd" => ("crates/lean-exporter/fixtures/vecadd.mir", &["vecadd"]),
-        "verified_gemm_views" => (
+    let (fixture_rel, default_fns): (&str, &[&str]) = match canonical_name {
+        "safe_vecadd" => ("crates/lean-exporter/fixtures/vecadd.mir", &["vecadd"]),
+        "safe_gemm_views" => (
             "crates/lean-exporter/fixtures/sgemm_tiled.mir",
             &["sgemm_tiled_views", "sgemm_tiled_raw"],
         ),
-        "verified_warp_reduce" => (
+        "safe_warp_reduce" => (
             "crates/lean-exporter/fixtures/warp_reduce.mir",
             &["warp_reduce_sum", "block_reduce_sum"],
         ),
+        "safe_subwarp_stage" => (
+            "crates/lean-exporter/fixtures/subwarp_multibuf.mir",
+            &["subwarp_bit_split_stage", "multibuf_subwarp_stage"],
+        ),
+        "safe_async_copy" => (
+            "crates/lean-exporter/fixtures/async_copy_stage.mir",
+            &["async_copy_stage"],
+        ),
         _ => {
             return Err(format!(
-                "no PostMem2Reg MIR fixture registered for verified example `{example_name}`"
+                "no PostMem2Reg MIR fixture registered for example `{example_name}`"
             ));
         }
     };

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Lean 4 verified warp butterfly reduction (`warp_reduce_sum`) and 2-phase
-//! shared-memory block reduction (`block_reduce_sum`).
+//! Provably safe warp butterfly reduction (`warp_reduce_sum`) and 2-phase
+//! shared-memory block reduction (`block_reduce_sum`) checked by Lean 4.
 //!
 //! ```text
 //!   KERNEL 1: `warp_reduce_sum` (1D Warp Butterfly Reduction)
@@ -39,7 +39,7 @@ const NUM_BLOCKS: u32 = 4;
 /// Total number of elements and launched threads across the grid (`1,024`).
 const N: usize = (BLOCK_SIZE * NUM_BLOCKS) as usize;
 
-/// Device kernel module containing the verified warp and 2-phase block reductions.
+/// Device kernel module containing the provably safe warp and 2-phase block reductions.
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -52,11 +52,7 @@ mod kernels {
         block = (256, 1, 1),
         requires = (data.len() >= out.len()),
     )]
-    #[verify(
-        no_oob_idx(data, out),
-        disjoint_writes(out),
-        writes_all_elems(out),
-    )]
+    #[verify(no_oob_idx(data, out), disjoint_writes(out), writes_all_elems(out))]
     #[kernel]
     pub fn warp_reduce_sum(data: &[f32], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
@@ -81,11 +77,7 @@ mod kernels {
         block = (256, 1, 1),
         requires = (data.len() >= out.len()),
     )]
-    #[verify(
-        no_oob_idx(WARP_SUMS),
-        no_data_race(WARP_SUMS),
-        uniform_barriers,
-    )]
+    #[verify(no_oob_idx(WARP_SUMS), no_data_race(WARP_SUMS), uniform_barriers)]
     pub fn block_reduce_sum(data: &[f32], mut out: DisjointSlice<f32>) {
         /// Shared-memory scratchpad holding one partial sum per warp (`8` floats).
         static mut WARP_SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
@@ -99,14 +91,14 @@ mod kernels {
         let val = if gid < data.len() { data[gid] } else { 0.0 };
         let warp_sum = warp::reduce_sum_f32(val);
 
-        // Phase 0 (Lean-verified `no_oob_idx` + `no_data_race` under `lane == 0`):
+        // Phase 0 (provably safe `no_oob_idx` + `no_data_race` under `lane == 0`):
         if lane == 0 {
             WARP_SUMS[tid / 32] = warp_sum;
         }
 
         thread::sync_threads();
 
-        // Phase 1 (Lean-verified `no_oob_idx` + `no_data_race` + `uniform_barriers`):
+        // Phase 1 (provably safe `no_oob_idx` + `no_data_race` + `uniform_barriers`):
         let mut block_sum = 0.0f32;
         let mut w = 0usize;
         while w < WARPS_PER_BLOCK {
@@ -121,7 +113,7 @@ mod kernels {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Lean-Verified Warp & Block Reduction (`verified_warp_reduce`) ===\n");
+    println!("=== Provably Safe Warp & Block Reduction (`safe_warp_reduce`) ===\n");
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -163,12 +155,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Contract & Lean 4 Proof Summary:");
     println!("  • Launch contract:   domain = 1, block = (256, 1, 1)");
-    println!("  • warp_reduce_sum:   Proved no_oob_idx(data, out), disjoint_writes(out), writes_all_elems(out)");
-    println!("                       Elided: 1 global slice `mir.assert` bounds check (`data[gid]`)");
-    println!("  • block_reduce_sum:  Proved no_oob_idx(WARP_SUMS), no_data_race(WARP_SUMS), uniform_barriers");
-    println!("                       Phase 0: `if lane == 0` -> `WARP_SUMS[tid / 32]` (`no_oob_tile_group_slot` + `no_data_race_group_leader_slot`)");
-    println!("                       Phase 1: `while w < 8`  -> `WARP_SUMS[w]`        (`no_oob_tile_linear_scan` + `no_data_race_diff_phase`)");
-    println!("                       Elided: 2 SharedArray `mir.assert` bounds checks (`0` unsafe blocks!)");
+    println!(
+        "  • warp_reduce_sum:   Proved no_oob_idx(data, out), disjoint_writes(out), writes_all_elems(out)"
+    );
+    println!(
+        "                       Elided: 1 global slice `mir.assert` bounds check (`data[gid]`)"
+    );
+    println!(
+        "  • block_reduce_sum:  Proved no_oob_idx(WARP_SUMS), no_data_race(WARP_SUMS), uniform_barriers"
+    );
+    println!(
+        "                       Phase 0: `if lane == 0` -> `WARP_SUMS[tid / 32]` (`no_oob_tile_group_slot` + `no_data_race_group_leader_slot`)"
+    );
+    println!(
+        "                       Phase 1: `while w < 8`  -> `WARP_SUMS[w]`        (`no_oob_tile_linear_scan` + `no_data_race_diff_phase`)"
+    );
+    println!(
+        "                       Elided: 2 SharedArray `mir.assert` bounds checks (`0` unsafe blocks!)"
+    );
     println!(
         "\nVerified warp reduction ({expected_warp_sum}) and 2-phase block reduction ({expected_block_sum}) across all {N} threads!"
     );

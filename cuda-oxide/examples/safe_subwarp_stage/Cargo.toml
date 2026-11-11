@@ -1,5 +1,5 @@
 [package]
-name = "verified_vecadd"
+name = "safe_subwarp_stage"
 version = "0.1.0"
 edition = "2024"
 authors = ["Nihal Pasham <nihalp@nvidia.com>"]

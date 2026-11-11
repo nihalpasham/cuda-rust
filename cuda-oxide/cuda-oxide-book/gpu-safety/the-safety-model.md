@@ -1,4 +1,4 @@
-# The Safety Model
+# Safe Kernels Using Rust's Type System
 
 A GPU kernel runs thousands of threads that all see the same memory at the
 same time. On a CPU, Rust prevents data races through ownership and borrowing

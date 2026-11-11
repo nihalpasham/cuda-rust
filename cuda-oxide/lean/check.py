@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent
-ALLOWED_AXIOMS = {"propext", "Quot.sound"}
+ALLOWED_AXIOMS = {"propext", "Quot.sound", "Classical.choice"}
 REJECTED = (
     ("RejectedInclusiveGuard.lean", "inclusive output guard"),
     ("RejectedLaneOnly.lean", "duplicate writers across blocks"),

@@ -1,4 +1,4 @@
-# Verified Kernels: From Safe(ish) SIMT to Safe SIMT
+# Provably Safe Kernels
 
 On a CPU, **Safe Rust** means your program has zero undefined behavior:
 - No out-of-bounds memory accesses
@@ -8,9 +8,9 @@ On a CPU, **Safe Rust** means your program has zero undefined behavior:
 Notice what Safe Rust does *not* mean: it does not prove **functional correctness** (that your math formula is right). Writing `a[i] - b[i]` when you meant `a[i] + b[i]` is a logic bug, but it is still 100% memory-safe Rust.
 
 On a GPU, thousands of threads run the same kernel function at once, and the Rust borrow checker cannot reason about thread coordinates or barriers:
-- **What Rust types already cover**: [The Safety Model](the-safety-model.md) proves one-thread-per-element writes with disjoint slices, and [Bounds Checks](bounds-checks.md) hoists row and column checks with matrix views.
+- **What Rust types already cover**: [Safe Kernels Using Rust's Type System](the-safety-model.md) proves one-thread-per-element writes with disjoint slices, and [Bounds Checks](bounds-checks.md) hoists row and column checks with matrix views.
 - **Where Rust types stop**: When 256 threads share an on-chip tile across barriers, the borrow checker cannot tell if two threads collide or if a barrier sits inside an `if` branch. Until now, those kernels needed `unsafe` blocks or unchecked indexing flags.
-- **How we close the gap**: The `#[verify(...)]` attribute pairs Rust's type system with compile-time **Lean 4** proofs, turning "safe(ish) SIMT" into **Safe SIMT**.
+- **How we make them provably safe**: The `#[verify(...)]` attribute pairs Rust's type system with compile-time **Lean 4** safety proofs, turning "safe(ish) SIMT" into **Provably Safe SIMT**.
 
 ```{figure} images/three-gpu-hazards.svg
 :alt: Three GPU safety hazards proved at compile time by the verify attribute
@@ -85,13 +85,15 @@ Unlike a C or CUDA C++ verifier, Lean 4 does not need to prove pointer validity,
 
 The Lean exporter has two modes:
 - **Scalar mode**: Translates a pure integer function line-by-line into fixed-width bitvector math.
-- **Kernel mode**: Walks the kernel's control-flow graph using two buckets of state (**Bucket 1**: a map tracking each SSA variable's index or coordinate role, and **Bucket 2**: CFG lists tracking each basic block's barrier phase and `if` guards) to extract a **kernel summary** and emit one theorem per verification clause. Floating-point math is ignored because it cannot change array indices.
+- **Kernel mode**: Walks the kernel's control-flow graph using two buckets of state (**Bucket 1**: an SSA map that builds compositional index expressions `IdxExpr` and branch conditions `GuardExpr`, and **Bucket 2**: CFG lists tracking each basic block's barrier phase and dominating guards) to extract a **kernel summary** and emit one theorem per verification clause. Floating-point math is ignored because it cannot change array indices.
 
 How one `no_oob_idx` clause maps to the right reusable proof in Lean:
 - **1D global slice**: proved from the `if` guard and the host length check.
 - **2D global row or column strip**: proved from the strip start check and loop bound.
 - **2D shared memory tile**: proved from the 2D thread coordinates (`tx < 16`, `ty < 16`) and loop bound (`i < 16`).
 - **Shared warp-leader slot and scan**: proved from the block size (`tid < 256` implies `tid / 32 < 8`) and scan loop bound (`w < 8`).
+- **Sub-warp bit-splits and packed multi-buffer staging**: proved from the bit-split bijection (`(tid >> 4) * 16 + (tid & 15) = tid`), active-thread guards (`if tid < 64`), and packed loop bounds (`w < 4` implies `tid * 4 + w < 256`).
+- **Asynchronous TMA bulk copies and `mbarrier` token handoffs**: proved from single-leader TMA issue (`if tid == 0`), expected-byte arrival (`mbarrier_arrive_expect_tx`), and dominating `mbarrier_try_wait_parity` completion before consumer reads.
 
 ### Trusted Computing Base
 
@@ -135,7 +137,7 @@ How to read that error in three quick steps:
 
 ### Example 1: 1D Vector Addition
 
-In `verified_vecadd`, each thread checks `c.get_mut(idx)` (`idx < c.len()`) and then reads `a[idx_raw]` and `b[idx_raw]`:
+In `safe_vecadd`, each thread checks `c.get_mut(idx)` (`idx < c.len()`) and then reads `a[idx_raw]` and `b[idx_raw]`:
 
 ```rust
 #[launch_contract(
@@ -166,14 +168,14 @@ What happens when you build:
 You can inspect the MIR input and generated Lean theorems at any time:
 
 ```console
-$ cargo oxide lean-export verified_vecadd
+$ cargo oxide lean-export safe_vecadd
 ```
 
 ---
 
 ### Example 2: 2D Tiled Matrix Multiply (Shared Memory + Barriers)
 
-In a 2D tiled matrix multiply (`verified_gemm_views`), a 16x16 block of 256 threads cooperates in two phases separated by a barrier:
+In a 2D tiled matrix multiply (`safe_gemm_views`), a 16x16 block of 256 threads cooperates in two phases separated by a barrier:
 - **Phase 0 (Stage)**: Each thread `(tx, ty)` writes one float into shared memory at its own slot (`ty * 16 + tx`).
 - **Barrier**: All 256 threads wait at `sync_threads()` until both shared tiles are full.
 - **Phase 1 (Scan)**: Each thread loops 16 times (`i = 0..16`), reading across row `ty` of tile A and down column `tx` of tile B.
@@ -242,8 +244,8 @@ pub fn sgemm_tiled_raw(
 Inspect both verified kernels or run the benchmark with:
 
 ```console
-$ cargo oxide lean-export verified_gemm_views
-$ cargo oxide run verified_gemm_views
+$ cargo oxide lean-export safe_gemm_views
+$ cargo oxide run safe_gemm_views
 ```
 
 | Kernel Variant                   | Safety Status | Bounds Checks Removed by Lean 4  | Throughput (1024³) |
@@ -325,6 +327,169 @@ How Lean 4 proves this kernel (and what happens if you make a mistake):
 Inspect both exported reduction kernels or run them on the GPU with:
 
 ```console
-$ cargo oxide lean-export verified_warp_reduce
-$ cargo oxide run verified_warp_reduce
+$ cargo oxide lean-export safe_warp_reduce
+$ cargo oxide run safe_warp_reduce
+```
+
+---
+
+### Example 4: Sub-Warp Bitwise Splits & Multi-Buffer Staging
+
+High-throughput kernels often split a 256-thread 1D block into **16 sub-warps of 16 lanes** using bitwise shifts and masks (`m_local = tid >> 4`, `k_lane = tid & 15`) and stage data across **multiple shared-memory buffers** of different sizes (`S_X_DIRECT`, `S_XS_DIRECT`, and `S_ACT_DIRECT`) over three barrier phases:
+- **Phase 0 (Guarded & Packed Stage)**: Under `if tid < 64`, each active thread writes one scale into `S_XS_DIRECT[tid]` (`64` floats) and four packed activations into `S_X_DIRECT[tid * 4 + w]` (`256` floats).
+- **Phase 1 (Sub-Warp Scan & Leader Write)**: Every thread scans `S_X_DIRECT[k_lane * 16 + g]` and `S_XS_DIRECT[k_lane * 4 + g]` (`k_lane < 16`), reduces across its 16-lane sub-warp, and under `if k_lane == 0` writes `S_ACT_DIRECT[m_local]` (`16` floats).
+- **Phase 2 (Epilogue Read)**: After a second `sync_threads()`, threads under `if tid < 16` read `S_ACT_DIRECT[tid]`.
+
+```rust
+#[kernel(launch_context = lc)]
+#[launch_bounds(256)]
+#[launch_contract(
+    domain = 1,
+    coordinates = u32,
+    block = (256, 1, 1),
+    requires = (data.len() >= out.len()),
+)]
+#[verify(
+    no_oob_idx(S_X_DIRECT, S_XS_DIRECT, S_ACT_DIRECT),
+    no_data_race(S_X_DIRECT, S_XS_DIRECT, S_ACT_DIRECT),
+    uniform_barriers,
+)]
+pub fn multibuf_subwarp_stage(data: &[f32], mut out: DisjointSlice<f32>) {
+    static mut S_X_DIRECT: SharedArray<f32, 256> = SharedArray::UNINIT;
+    static mut S_XS_DIRECT: SharedArray<f32, 64> = SharedArray::UNINIT;
+    static mut S_ACT_DIRECT: SharedArray<f32, 16> = SharedArray::UNINIT;
+
+    let idx = thread::index_1d();
+    let gid = idx.get();
+    let tid = thread::threadIdx_x() as usize;
+    let m_local = tid >> 4;
+    let k_lane = tid & 15;
+    let base_val = if gid < data.len() { data[gid] } else { 0.0 };
+
+    // Phase 0 (Lean-verified under `if tid < 64`):
+    if tid < 64 {
+        S_XS_DIRECT[tid] = 0.5f32;
+        let mut w = 0usize;
+        while w < 4 {
+            S_X_DIRECT[tid * 4 + w] = base_val;
+            w += 1;
+        }
+    }
+
+    thread::sync_threads();
+
+    // Phase 1 (Lean-verified sub-warp lane scan + `if k_lane == 0` leader write):
+    let mut sum = 0.0f32;
+    let mut g = 0usize;
+    while g < 4 {
+        sum += S_X_DIRECT[k_lane * 16 + g] * S_XS_DIRECT[k_lane * 4 + g];
+        g += 1;
+    }
+    sum += warp::shuffle_xor_f32(sum, 8);
+    sum += warp::shuffle_xor_f32(sum, 4);
+    sum += warp::shuffle_xor_f32(sum, 2);
+    sum += warp::shuffle_xor_f32(sum, 1);
+
+    if k_lane == 0 {
+        S_ACT_DIRECT[m_local] = sum;
+    }
+
+    thread::sync_threads();
+
+    // Phase 2 (Lean-verified under `if tid < 16` after second barrier):
+    let mut final_val = sum;
+    if tid < 16 {
+        final_val = S_ACT_DIRECT[tid];
+    }
+
+    if let Some(out_elem) = out.get_mut(idx) {
+        *out_elem = final_val;
+    }
+}
+```
+
+How Lean 4 proves all three buffers and removes all 6 shared-memory bounds checks:
+- **Guarded and packed bounds (`Phase 0`)**: The exporter tracks `if tid < 64` as the active thread bound for Phase 0, proving `tid < 64` for `S_XS_DIRECT` and `tid * 4 + w < 64 * 4 = 256` for `S_X_DIRECT`. Because `w < 4`, distinct threads own disjoint 4-element segments (`tid₁ * 4 + w₁ = tid₂ * 4 + w₂` implies `tid₁ = tid₂`).
+- **Sub-warp bit-split bounds and leader exclusivity (`Phase 1`)**: Because `k_lane = tid & 15 < 16` for every thread, `k_lane * 16 + g < 256` and `k_lane * 4 + g < 64` hold across all 256 threads, while `if k_lane == 0` guarantees a single writer per sub-warp slot `m_local = tid >> 4 < 16`.
+- **Three-phase barrier separation (`Phase 0 -> 1 -> 2`)**: Two uniform `sync_threads()` barriers separate Phase 0 writes, Phase 1 reads/writes, and Phase 2 reads. Widening `if tid < 64` to `if tid < 128` or dropping the second barrier is rejected by Lean 4 at compile time.
+
+Inspect both Stage 4 kernels (`subwarp_bit_split_stage` and `multibuf_subwarp_stage`) or run them on the GPU with:
+
+```console
+$ cargo oxide lean-export safe_subwarp_stage
+$ cargo oxide run safe_subwarp_stage
+```
+
+---
+
+### Example 5: Asynchronous TMA Bulk Copy & `mbarrier` Token Ordering
+
+On Hopper and Blackwell GPUs, global-to-shared transfers run asynchronously on the **Tensor Memory Accelerator (TMA)** hardware engine while threads synchronize through a 64-bit shared-memory **`mbarrier`** (`BAR`) instead of `sync_threads()`:
+- **Producer (`if tid == 0`)**: Sets the expected arrival and byte counts via `mbarrier_arrive_expect_tx(&raw const BAR, 1, TILE_BYTES)` and launches `cp_async_bulk_tensor_2d_g2s_cta(&raw mut TILE as *mut u8, tensor_map, tile_x, tile_y, &raw mut BAR)`.
+- **Consumer Wait (all 256 threads)**: Spin-waits on `while !mbarrier_try_wait_parity(&raw const BAR, 0) {}` until both the arrival count and byte count hit zero.
+- **Consumer Read (all 256 threads)**: Reads `TILE[tid]` with **zero `unsafe` blocks** in the kernel body.
+
+```rust
+#[kernel(launch_context = lc)]
+#[launch_bounds(256)]
+#[launch_contract(
+    domain = 1,
+    coordinates = u32,
+    block = (256, 1, 1),
+)]
+#[verify(
+    no_oob_idx(TILE),
+    no_data_race(TILE),
+    uniform_barriers,
+)]
+pub fn async_copy_stage(
+    #[grid_constant] tensor_map: &TmaDescriptor,
+    mut out: DisjointSlice<f32>,
+    tile_x: i32,
+    tile_y: i32,
+) {
+    static mut TILE: SharedArray<f32, 4096, 128> = SharedArray::UNINIT;
+    static mut BAR: Barrier = Barrier::UNINIT;
+
+    let idx = thread::index_1d();
+    let tid = thread::threadIdx_x() as usize;
+
+    if tid == 0 {
+        mbarrier_init(&raw mut BAR, 1);
+        fence_proxy_async_shared_cta();
+    }
+    thread::sync_threads();
+
+    // Producer (`if tid == 0` mints token `StageProduced(TILE, BAR)`):
+    if tid == 0 {
+        let _ = mbarrier_arrive_expect_tx(&raw const BAR, 1, 16384);
+        cp_async_bulk_tensor_2d_g2s_cta(
+            &raw mut TILE as *mut u8,
+            tensor_map,
+            tile_x,
+            tile_y,
+            &raw mut BAR,
+        );
+    }
+
+    // Token handoff (`StageProduced(TILE, BAR)` -> `StageReady(BAR)`):
+    while !mbarrier_try_wait_parity(&raw const BAR, 0) {}
+
+    // Consumer read dominated by `StageReady(BAR)` (0 `unsafe` blocks!):
+    let val = TILE[tid];
+    if let Some(out_elem) = out.get_mut(idx) {
+        *out_elem = val;
+    }
+}
+```
+
+How `lean-exporter` and Lean 4 verify the asynchronous token chain:
+- **Single-leader producer (`no_data_race_single_leader`)**: Because the TMA copy is guarded by `if tid == 0`, Lean 4 proves only thread 0 issues the write to `TILE`.
+- **Token-ordered phase separation (`StageProduced` -> `StageReady`)**: The exporter checks that `BAR` is armed by `mbarrier_arrive_expect_tx`, bound to `TILE` by `cp_async_bulk_tensor_2d_g2s_cta`, and awaited on all paths to `TILE[tid]` via `mbarrier_try_wait_parity(&raw const BAR, 0)`. Omitting `mbarrier_arrive_expect_tx`, skipping the wait, or waiting on a different barrier leaves `TILE[tid]` in the producer phase and is rejected by Lean 4 at compile time.
+
+Inspect the exported Lean proof or run the TMA copy on the GPU with:
+
+```console
+$ cargo oxide lean-export safe_async_copy
+$ cargo oxide run safe_async_copy
 ```

@@ -206,6 +206,29 @@ impl VerifiedSharedArrayRewriter {
             .get_ident()
             .is_some_and(|id| self.verified_shared.iter().any(|v| v == id))
     }
+    fn is_verified_async_barrier_call(expr: &Expr) -> bool {
+        let Expr::Call(call_expr) = expr else {
+            return false;
+        };
+        let Expr::Path(path_expr) = &*call_expr.func else {
+            return false;
+        };
+        let Some(last) = path_expr.path.segments.last() else {
+            return false;
+        };
+        let name = last.ident.to_string();
+        matches!(
+            name.as_str(),
+            "mbarrier_init"
+                | "mbarrier_inval"
+                | "mbarrier_arrive"
+                | "mbarrier_arrive_expect_tx"
+                | "mbarrier_try_wait"
+                | "mbarrier_try_wait_parity"
+                | "mbarrier_test_wait"
+                | "fence_proxy_async_shared_cta"
+        ) || name.starts_with("cp_async_bulk_tensor_")
+    }
 }
 
 impl VisitMut for VerifiedSharedArrayRewriter {
@@ -233,6 +256,16 @@ impl VisitMut for VerifiedSharedArrayRewriter {
             if self.is_verified_shared_index(expr) {
                 if let Expr::Index(idx) = expr {
                     visit_mut::visit_expr_mut(self, &mut idx.index);
+                }
+                let inner = expr.clone();
+                *expr = parse_quote! { unsafe { #inner } };
+                return;
+            }
+            if Self::is_verified_async_barrier_call(expr) {
+                if let Expr::Call(call_expr) = expr {
+                    for arg in &mut call_expr.args {
+                        visit_mut::visit_expr_mut(self, arg);
+                    }
                 }
                 let inner = expr.clone();
                 *expr = parse_quote! { unsafe { #inner } };
@@ -272,7 +305,8 @@ fn rewrite_verified_shared_accesses(
     }
 }
 
-/// Collect in-body `static mut NAME: SharedArray<T, N>` declarations in source order.
+/// Collect in-body `static mut NAME: SharedArray<T, N>` declarations sorted by
+/// identifier name so `shared_id` (`0..N`) matches `lean-exporter`.
 fn collect_shared_array_statics(stmts: &[Stmt]) -> Vec<Ident> {
     let mut names = Vec::new();
     for stmt in stmts {
@@ -282,6 +316,7 @@ fn collect_shared_array_statics(stmts: &[Stmt]) -> Vec<Ident> {
             names.push(item_static.ident.clone());
         }
     }
+    names.sort_by_key(|a| a.to_string());
     names
 }
 

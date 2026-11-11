@@ -236,23 +236,6 @@ pub(crate) fn parse_kernel_verification_spec(
         ));
     }
 
-    let mut writable_params = BTreeSet::new();
-    for (idx, ty) in inputs.iter().enumerate() {
-        let ty_ref = ty.deref(ctx);
-        if let Some(slice) = ty_ref.downcast_ref::<MirSliceType>() {
-            if slice.is_mutable() {
-                writable_params.insert(idx);
-            }
-        } else if ty_ref.downcast_ref::<MirDisjointSliceType>().is_some() {
-            writable_params.insert(idx);
-        } else if domain == 1 {
-            return Err(reject(
-                "kernel signature",
-                format!("parameter {idx} must be a slice or DisjointSlice in the v0 kernel subset"),
-            ));
-        }
-    }
-
     let requires_len_ge = match get_string_attr(attrs, "contract_requires_len_ge") {
         Some(raw) => parse_requires_len_ge(&raw, arity)?,
         None => BTreeSet::new(),
@@ -279,6 +262,25 @@ pub(crate) fn parse_kernel_verification_spec(
     };
     let uniform_barriers =
         get_string_attr(attrs, "verify_uniform_barriers").as_deref() == Some("true");
+
+    let is_phased_shared =
+        !no_oob_shared.is_empty() || !no_data_race.is_empty() || uniform_barriers;
+    let mut writable_params = BTreeSet::new();
+    for (idx, ty) in inputs.iter().enumerate() {
+        let ty_ref = ty.deref(ctx);
+        if let Some(slice) = ty_ref.downcast_ref::<MirSliceType>() {
+            if slice.is_mutable() {
+                writable_params.insert(idx);
+            }
+        } else if ty_ref.downcast_ref::<MirDisjointSliceType>().is_some() {
+            writable_params.insert(idx);
+        } else if domain == 1 && !is_phased_shared {
+            return Err(reject(
+                "kernel signature",
+                format!("parameter {idx} must be a slice or DisjointSlice in the v0 kernel subset"),
+            ));
+        }
+    }
 
     for &param in disjoint_writes.iter().chain(writes_all_elems.iter()) {
         if !writable_params.contains(&param) {

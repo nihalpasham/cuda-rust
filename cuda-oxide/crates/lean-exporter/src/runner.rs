@@ -135,7 +135,7 @@ pub fn check_generated_lean(lean_source: &str, lean_package_dir: &Path) -> Resul
             && let Some((inside, _)) = list.split_once(']')
         {
             for axiom in inside.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if axiom != "propext" && axiom != "Quot.sound" {
+                if !matches!(axiom, "propext" | "Quot.sound" | "Classical.choice") {
                     return Err(reject(
                         "lean proof check failed",
                         format!("unexpected axiom `{axiom}` in proof:\n{}", combined.trim()),

@@ -15,7 +15,7 @@
 use crate::{
     ExportError, reject,
     spec::KernelVerificationSpec,
-    ssa::{GlobalStripKind, TileAccessPatternKind},
+    ssa::{GlobalStripKind, GuardExpr, IdxExpr, TileAccessPatternKind},
     translate::{
         AccessKind, ExtractedAccess, GlobalStripAccess2D, PhasedSharedAccess, TranslatedFunction,
     },
@@ -268,15 +268,49 @@ fn render_verified_kernel_module(
     ))
 }
 
+/// Format a compositional [`IdxExpr`] into its Lean `CudaOxide.Mir.Kernel.IdxExpr` constructor tree.
+fn format_idx_expr(expr: &IdxExpr) -> String {
+    match expr {
+        IdxExpr::Tx => ".tx".to_string(),
+        IdxExpr::Ty => ".ty".to_string(),
+        IdxExpr::LoopVar { .. } => ".loopVar".to_string(),
+        IdxExpr::Const(n) => format!("(.const {n})"),
+        IdxExpr::Add(a, b) => format!("(.add {} {})", format_idx_expr(a), format_idx_expr(b)),
+        IdxExpr::Mul(a, b) => format!("(.mul {} {})", format_idx_expr(a), format_idx_expr(b)),
+        IdxExpr::Div(a, d) => format!("(.div {} {d})", format_idx_expr(a)),
+        IdxExpr::Mod(a, d) => format!("(.mod {} {d})", format_idx_expr(a)),
+    }
+}
+
+/// Format a compositional [`GuardExpr`] into its Lean `CudaOxide.Mir.Kernel.GuardExpr` constructor tree.
+fn format_guard_expr(guard: &GuardExpr) -> String {
+    match guard {
+        GuardExpr::True => ".tr".to_string(),
+        GuardExpr::Lt(a, b) => format!("(.lt {} {})", format_idx_expr(a), format_idx_expr(b)),
+        GuardExpr::Ge(a, b) => format!("(.ge {} {})", format_idx_expr(a), format_idx_expr(b)),
+        GuardExpr::Eq(a, b) => format!("(.eq {} {})", format_idx_expr(a), format_idx_expr(b)),
+        GuardExpr::Ne(a, b) => format!("(.ne {} {})", format_idx_expr(a), format_idx_expr(b)),
+        GuardExpr::And(p, q) => format!("(.and {} {})", format_guard_expr(p), format_guard_expr(q)),
+    }
+}
+
 /// Format a [`TileAccessPatternKind`] into its corresponding Lean
 /// `CudaOxide.Mir.Kernel.TileAccessPattern` constructor expression.
-fn format_tile_pattern(pat: TileAccessPatternKind) -> String {
+fn format_tile_pattern(pat: &TileAccessPatternKind) -> String {
     match pat {
         TileAccessPatternKind::ThreadSlot { stride } => format!(".threadSlot {stride}"),
         TileAccessPatternKind::RowScan { stride } => format!(".rowScan {stride}"),
         TileAccessPatternKind::ColScan { stride } => format!(".colScan {stride}"),
         TileAccessPatternKind::GroupSlot { group_size } => format!(".groupSlot {group_size}"),
         TileAccessPatternKind::LinearScan => ".linearScan".to_string(),
+        TileAccessPatternKind::PackedSlot { pack } => format!(".packedSlot {pack}"),
+        TileAccessPatternKind::GroupLaneScan { group_size, pack } => {
+            format!(".groupLaneScan {group_size} {pack}")
+        }
+        TileAccessPatternKind::BitSplitSlot { group_size, stride } => {
+            format!(".bitSplitSlot {group_size} {stride}")
+        }
+        TileAccessPatternKind::Expr(expr) => format!(".expr {}", format_idx_expr(expr)),
     }
 }
 
@@ -287,14 +321,19 @@ fn format_phased_access(a: &PhasedSharedAccess) -> String {
         AccessKind::Read => ".read",
         AccessKind::Write => ".write",
     };
-    let pat = format_tile_pattern(a.pattern);
+    let pat = format_tile_pattern(&a.pattern);
     let leader_suffix = if a.leader_only {
         ", leaderOnly := true"
     } else {
         ""
     };
+    let guard_suffix = if a.guard != GuardExpr::True {
+        format!(", guard := {}", format_guard_expr(&a.guard))
+    } else {
+        String::new()
+    };
     format!(
-        "{{ kind := {kind}, space := .shared, bufferId := {}, phase := {}, pattern := {pat}, loopBound := {}{leader_suffix} }}",
+        "{{ kind := {kind}, space := .shared, bufferId := {}, phase := {}, pattern := {pat}, loopBound := {}{leader_suffix}{guard_suffix} }}",
         a.shared_id, a.phase, a.loop_bound
     )
 }
@@ -372,26 +411,32 @@ fn render_verified_tiled_2d_module(
         }
         for (idx, acc) in matching.iter().enumerate() {
             let thm_name = format!("verify_no_oob_idx_shared{shared_id}_{idx}");
-            let pat_str = format_tile_pattern(acc.pattern);
+            let pat_str = format_tile_pattern(&acc.pattern);
             let buf_len = acc.buffer_len;
             let loop_bound = acc.loop_bound;
-            let fits = by * bx <= buf_len;
-            let proof_line = match acc.pattern {
-                TileAccessPatternKind::ThreadSlot { stride } if stride == bx && fits => {
+            let tx_bound = acc.active_threads;
+            let fits_2d = by * bx <= buf_len;
+            let proof_line = match &acc.pattern {
+                TileAccessPatternKind::ThreadSlot { stride }
+                    if *stride == tx_bound && by * tx_bound <= buf_len =>
+                {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_slot (by decide)".to_string()
                 }
+                TileAccessPatternKind::ThreadSlot { .. } if by == 1 && tx_bound <= buf_len => {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_1d_slot (by decide)".to_string()
+                }
                 TileAccessPatternKind::RowScan { stride }
-                    if stride == bx && loop_bound == bx && fits =>
+                    if *stride == bx && loop_bound == bx && fits_2d =>
                 {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_row_scan (by decide)".to_string()
                 }
                 TileAccessPatternKind::ColScan { stride }
-                    if stride == bx && loop_bound == by && fits =>
+                    if *stride == bx && loop_bound == by && fits_2d =>
                 {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_col_scan (by decide)".to_string()
                 }
                 TileAccessPatternKind::GroupSlot { group_size }
-                    if group_size > 0 && bx.saturating_sub(1) / group_size < buf_len =>
+                    if *group_size > 0 && tx_bound.saturating_sub(1) / *group_size < buf_len =>
                 {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_group_slot (by decide) (by decide)"
                         .to_string()
@@ -399,14 +444,48 @@ fn render_verified_tiled_2d_module(
                 TileAccessPatternKind::LinearScan if loop_bound <= buf_len => {
                     "exact CudaOxide.Proofs.Bounds.no_oob_tile_linear_scan (by decide)".to_string()
                 }
+                TileAccessPatternKind::PackedSlot { pack }
+                    if loop_bound <= *pack && tx_bound * *pack <= buf_len =>
+                {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_packed_slot (by decide) (by decide)"
+                        .to_string()
+                }
+                TileAccessPatternKind::GroupLaneScan { group_size, pack }
+                    if *group_size > 0
+                        && loop_bound <= *pack
+                        && *group_size * *pack <= buf_len =>
+                {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_group_lane_scan (by decide) (by decide) (by decide)"
+                        .to_string()
+                }
+                TileAccessPatternKind::BitSplitSlot { group_size, stride }
+                    if *group_size > 0
+                        && *group_size <= *stride
+                        && (tx_bound.saturating_sub(1) / *group_size + 1) * *stride <= buf_len =>
+                {
+                    "exact CudaOxide.Proofs.Bounds.no_oob_tile_bit_split_slot (by decide) (by decide) (by decide)"
+                        .to_string()
+                }
                 _ => {
-                    "intro tx ty i htx hty hi\n  simp [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.globalIndex]\n  omega"
+                    if acc.guard != GuardExpr::True {
+                        let guard_str = format_guard_expr(&acc.guard);
+                        theorems.push(format!(
+                            "theorem {thm_name} :\n    \
+                             CudaOxide.Contracts.NoOobGuardedTileAccess {tx_bound} {by} {loop_bound} {guard_str} ({pat_str}) {buf_len} := by\n  \
+                             intro tx ty i htx hty hi hguard\n  \
+                             simp only [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.Kernel.IdxExpr.eval, CudaOxide.Mir.Kernel.GuardExpr.eval, CudaOxide.Mir.globalIndex] at hguard ⊢\n  \
+                             omega"
+                        ));
+                        axiom_prints.push(format!("#print axioms {thm_name}"));
+                        continue;
+                    }
+                    "intro tx ty i htx hty hi\n  simp only [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.Kernel.IdxExpr.eval, CudaOxide.Mir.globalIndex]\n  omega"
                         .to_string()
                 }
             };
             theorems.push(format!(
                 "theorem {thm_name} :\n    \
-                 CudaOxide.Contracts.NoOobTileAccess {bx} {by} {loop_bound} ({pat_str}) {buf_len} := by\n  \
+                 CudaOxide.Contracts.NoOobTileAccess {tx_bound} {by} {loop_bound} ({pat_str}) {buf_len} := by\n  \
                  {proof_line}"
             ));
             axiom_prints.push(format!("#print axioms {thm_name}"));
@@ -434,16 +513,19 @@ fn render_verified_tiled_2d_module(
                 let thm_name = format!("verify_no_data_race_shared{shared_id}_{i}_{j}");
                 let a1_str = format_phased_access(a1);
                 let a2_str = format_phased_access(a2);
+                let has_custom_guard = a1.guard != GuardExpr::True || a2.guard != GuardExpr::True;
                 let proof_line = if a1.phase != a2.phase {
                     "exact CudaOxide.Proofs.Launch.no_data_race_diff_phase (by decide)".to_string()
-                } else if a1.pattern == (TileAccessPatternKind::ThreadSlot { stride: bx })
+                } else if !has_custom_guard
+                    && a1.pattern == (TileAccessPatternKind::ThreadSlot { stride: bx })
                     && a2.pattern == (TileAccessPatternKind::ThreadSlot { stride: bx })
                     && a1.loop_bound == a2.loop_bound
                     && !a1.leader_only
                     && !a2.leader_only
                 {
                     "exact CudaOxide.Proofs.Launch.no_data_race_thread_slot".to_string()
-                } else if by == 1
+                } else if !has_custom_guard
+                    && by == 1
                     && a1.leader_only
                     && a2.leader_only
                     && a1.loop_bound == a2.loop_bound
@@ -451,9 +533,54 @@ fn render_verified_tiled_2d_module(
                     && a1.pattern == a2.pattern
                 {
                     "exact CudaOxide.Proofs.Launch.no_data_race_group_leader_slot".to_string()
+                } else if !has_custom_guard
+                    && by == 1
+                    && a1.leader_only
+                    && a2.leader_only
+                    && a1.loop_bound == a2.loop_bound
+                    && a1.pattern == TileAccessPatternKind::LinearScan
+                    && a2.pattern == TileAccessPatternKind::LinearScan
+                {
+                    "exact CudaOxide.Proofs.Launch.no_data_race_single_leader".to_string()
+                } else if !has_custom_guard
+                    && by == 1
+                    && !a1.leader_only
+                    && !a2.leader_only
+                    && let (
+                        TileAccessPatternKind::PackedSlot { pack: p1 },
+                        TileAccessPatternKind::PackedSlot { pack: p2 },
+                    ) = (&a1.pattern, &a2.pattern)
+                    && p1 == p2
+                    && a1.loop_bound <= *p1
+                    && a2.loop_bound <= *p2
+                {
+                    "exact CudaOxide.Proofs.Launch.no_data_race_packed_slot (by decide) (by decide)"
+                        .to_string()
+                } else if !has_custom_guard
+                    && by == 1
+                    && !a1.leader_only
+                    && !a2.leader_only
+                    && a1.loop_bound == a2.loop_bound
+                    && let (
+                        TileAccessPatternKind::BitSplitSlot {
+                            group_size: g1,
+                            stride: s1,
+                        },
+                        TileAccessPatternKind::BitSplitSlot {
+                            group_size: g2,
+                            stride: s2,
+                        },
+                    ) = (&a1.pattern, &a2.pattern)
+                    && g1 == g2
+                    && s1 == s2
+                    && *g1 > 0
+                    && *g1 <= *s1
+                {
+                    "exact CudaOxide.Proofs.Launch.no_data_race_bit_split_slot (by decide) (by decide)"
+                        .to_string()
                 } else {
                     "intro tx₁ ty₁ i₁ tx₂ ty₂ i₂ htx₁ hty₁ hi₁ htx₂ hty₂ hi₂ hact₁ hact₂ _ _ _ hsame\n  \
-                     simp [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.Kernel.PhasedTileAccess.active, CudaOxide.Mir.globalIndex] at hact₁ hact₂ hsame\n  \
+                     simp only [CudaOxide.Mir.Kernel.TileAccessPattern.address, CudaOxide.Mir.Kernel.PhasedTileAccess.active, CudaOxide.Mir.Kernel.IdxExpr.eval, CudaOxide.Mir.Kernel.GuardExpr.eval, CudaOxide.Mir.globalIndex] at hact₁ hact₂ hsame\n  \
                      omega"
                         .to_string()
                 };
@@ -487,6 +614,7 @@ fn render_verified_tiled_2d_module(
          -- SPDX-License-Identifier: Apache-2.0\n\
          -- Generated from PostMem2Reg dialect-mir (2D Phased Shared-Memory Kernel).\n\
          import CudaOxide\n\n\
+         set_option linter.unusedSimpArgs false\n\n\
          namespace CudaOxide.Generated\n\n\
          def kernelSummary : CudaOxide.Mir.Kernel.TiledKernelSummary2D :=\n  \
          {{ blockDimX := {bx}\n  \

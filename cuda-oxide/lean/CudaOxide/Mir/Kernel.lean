@@ -66,18 +66,84 @@ inductive MemorySpace where
   | shared
   deriving Repr, DecidableEq
 
-/-- Shared-memory tile or reduction indexing pattern inside a `(blockDimX, blockDimY, 1)` block. -/
+/-- Compositional index expression over thread coordinates `(tx, ty)` and loop step `i`. -/
+inductive IdxExpr where
+  /-- Thread X coordinate (`threadIdx.x`). -/
+  | tx
+  /-- Thread Y coordinate (`threadIdx.y`). -/
+  | ty
+  /-- Inner scan loop induction variable `i` (`0 ≤ i < loopBound`). -/
+  | loopVar
+  /-- Constant natural-number literal. -/
+  | const (n : Nat)
+  /-- Sum of two index expressions (`a + b`). -/
+  | add (a b : IdxExpr)
+  /-- Product of two index expressions (`a * b`). -/
+  | mul (a b : IdxExpr)
+  /-- Euclidean quotient `a / d` (from `/` or `>> k`). -/
+  | div (a : IdxExpr) (d : Nat)
+  /-- Euclidean remainder `a % d` (from `%` or `& (2^k - 1)`). -/
+  | mod (a : IdxExpr) (d : Nat)
+  deriving Repr, DecidableEq
+
+/-- Unfold an `IdxExpr` syntax tree into a `Nat` formula over `(tx, ty, i)`. -/
+def IdxExpr.eval (e : IdxExpr) (tx ty i : Nat) : Nat :=
+  match e with
+  | .tx => tx
+  | .ty => ty
+  | .loopVar => i
+  | .const n => n
+  | .add a b => a.eval tx ty i + b.eval tx ty i
+  | .mul a b => a.eval tx ty i * b.eval tx ty i
+  | .div a d => a.eval tx ty i / d
+  | .mod a d => a.eval tx ty i % d
+
+/-- Compositional branch-guard predicate over `(tx, ty, i)`. -/
+inductive GuardExpr where
+  /-- Unguarded (`True`). -/
+  | tr
+  /-- Strict upper bound `a < b` (e.g. `tid < 64`). -/
+  | lt (a b : IdxExpr)
+  /-- Lower bound `a ≥ b` (negation of `a < b`). -/
+  | ge (a b : IdxExpr)
+  /-- Equality guard `a = b` (e.g. `lane == 0` or `lane == 7`). -/
+  | eq (a b : IdxExpr)
+  /-- Inequality guard `a ≠ b` (negation of `a = b`). -/
+  | ne (a b : IdxExpr)
+  /-- Conjunction of two dominating branch guards (`p ∧ q`). -/
+  | and (p q : GuardExpr)
+  deriving Repr, DecidableEq
+
+/-- Unfold a `GuardExpr` syntax tree into a `Prop` over `(tx, ty, i)`. -/
+def GuardExpr.eval (g : GuardExpr) (tx ty i : Nat) : Prop :=
+  match g with
+  | .tr => True
+  | .lt a b => a.eval tx ty i < b.eval tx ty i
+  | .ge a b => a.eval tx ty i ≥ b.eval tx ty i
+  | .eq a b => a.eval tx ty i = b.eval tx ty i
+  | .ne a b => a.eval tx ty i ≠ b.eval tx ty i
+  | .and p q => p.eval tx ty i ∧ q.eval tx ty i
+
+/-- How threads in a block index into a shared-memory array (`SharedArray`). -/
 inductive TileAccessPattern where
-  /-- Unique per-thread staging slot `ty * stride + tx`. -/
+  /-- One fixed slot per thread (`TILE[ty * stride + tx]`). -/
   | threadSlot (stride : Nat)
-  /-- Row scan `ty * stride + i` across loop index `i`. -/
+  /-- Walk across row `ty`, one element per loop step `i` (`TILE[ty * stride + i]`). -/
   | rowScan (stride : Nat)
-  /-- Column scan `i * stride + tx` down loop index `i`. -/
+  /-- Walk down column `tx`, one element per loop step `i` (`TILE[i * stride + tx]`). -/
   | colScan (stride : Nat)
-  /-- Sub-group / warp slot `tx / groupSize` (e.g. `WARP_SUMS[tid / 32]`). -/
+  /-- One slot per warp or sub-warp team of `groupSize` threads (`WARP_SUMS[tx / groupSize]`). -/
   | groupSlot (groupSize : Nat)
-  /-- Linear scan `i` across loop index `i` (e.g. `WARP_SUMS[i]`). -/
+  /-- Walk straight across a 1D array, one element per loop step `i` (`WARP_SUMS[i]`). -/
   | linearScan
+  /-- A contiguous chunk of `pack` slots owned by each thread `tx` (`S_X[tx * pack + i]`). -/
+  | packedSlot (pack : Nat)
+  /-- A chunk of `pack` slots indexed by a thread's lane `tx % groupSize` inside its sub-warp (`S_XS[(tx % groupSize) * pack + i]`). -/
+  | groupLaneScan (groupSize pack : Nat)
+  /-- A 1D thread ID `tx` split into a 2D `(row = tx / groupSize, col = tx % groupSize)` cell (`TILE[(tx / groupSize) * stride + (tx % groupSize)]`). -/
+  | bitSplitSlot (groupSize stride : Nat)
+  /-- General compositional index expression `e` built from SSA operations. -/
+  | expr (e : IdxExpr)
   deriving Repr, DecidableEq
 
 /-- Evaluate the flat element index of a shared-memory access for thread `(tx, ty)` at step `i`. -/
@@ -88,6 +154,11 @@ def TileAccessPattern.address (pat : TileAccessPattern) (tx ty i : Nat) : Nat :=
   | .colScan stride => CudaOxide.Mir.globalIndex stride i tx
   | .groupSlot groupSize => tx / groupSize
   | .linearScan => i
+  | .packedSlot pack => CudaOxide.Mir.globalIndex pack tx i
+  | .groupLaneScan groupSize pack => CudaOxide.Mir.globalIndex pack (tx % groupSize) i
+  | .bitSplitSlot groupSize stride =>
+      CudaOxide.Mir.globalIndex stride (tx / groupSize) (tx % groupSize)
+  | .expr e => e.eval tx ty i
 
 /-- A shared-memory tile access tagged with its barrier phase (`0`, `1`, ...). -/
 structure PhasedTileAccess where
@@ -105,16 +176,21 @@ structure PhasedTileAccess where
   loopBound : Nat := 1
   /-- True when guarded by a leader check (`tx % groupSize = 0` or `tx = 0`). -/
   leaderOnly : Bool := false
+  /-- Optional compositional branch guard (`GuardExpr.tr` when unguarded or covered by `leaderOnly`). -/
+  guard : GuardExpr := .tr
   deriving Repr, DecidableEq
 
 /-- Predicate describing which threads `tx` execute `a` (all threads when
-    `leaderOnly = false`; only group leaders `tx % groupSize = 0` or `tx = 0`
-    when `leaderOnly = true`). -/
+    unguarded; only threads satisfying `a.guard` and/or `leaderOnly` when guarded). -/
 def PhasedTileAccess.active (a : PhasedTileAccess) (tx : Nat) : Prop :=
-  match a.leaderOnly, a.pattern with
-  | true, .groupSlot groupSize => tx % groupSize = 0
-  | true, _ => tx = 0
-  | false, _ => True
+  let leaderProp :=
+    match a.leaderOnly, a.pattern with
+    | true, .groupSlot groupSize => tx % groupSize = 0
+    | true, _ => tx = 0
+    | false, _ => True
+  match a.guard with
+  | .tr => leaderProp
+  | g => leaderProp ∧ g.eval tx 0 0
 
 /-- Summary of a 2D phased shared-memory kernel extracted at `PostMem2Reg`. -/
 structure TiledKernelSummary2D where

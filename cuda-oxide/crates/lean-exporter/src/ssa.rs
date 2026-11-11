@@ -27,31 +27,304 @@ use pliron::value::Value;
 
 use crate::{ExportError, reject};
 
-/// 2D shared-memory tile coordinate shape inside a `(blockDimX, blockDimY, 1)` block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Compositional symbolic index expression over thread coordinates `(tx, ty)` and loop step `i`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdxExpr {
+    /// Thread X coordinate (`threadIdx.x`).
+    Tx,
+    /// Thread Y coordinate (`threadIdx.y`).
+    Ty,
+    /// Inner scan loop induction variable `i` (`0 <= i < bound`).
+    LoopVar {
+        /// Exclusive upper bound on `i` from `while i < bound`.
+        bound: u64,
+    },
+    /// Unsigned integer constant literal.
+    Const(u64),
+    /// Sum `lhs + rhs`.
+    Add(Box<IdxExpr>, Box<IdxExpr>),
+    /// Product `lhs * rhs`.
+    Mul(Box<IdxExpr>, Box<IdxExpr>),
+    /// Euclidean quotient `lhs / divisor` (from `/` or `>> sh`).
+    Div(Box<IdxExpr>, u64),
+    /// Euclidean remainder `lhs % divisor` (from `%` or `& (2^k - 1)`).
+    Mod(Box<IdxExpr>, u64),
+}
+
+impl IdxExpr {
+    /// Return true if this expression depends on a thread coordinate (`Tx`, `Ty`)
+    /// or a bounded loop induction variable (`LoopVar`).
+    pub fn has_coord(&self) -> bool {
+        match self {
+            Self::Tx | Self::Ty | Self::LoopVar { .. } => true,
+            Self::Const(_) => false,
+            Self::Add(a, b) | Self::Mul(a, b) => a.has_coord() || b.has_coord(),
+            Self::Div(a, _) | Self::Mod(a, _) => a.has_coord(),
+        }
+    }
+
+    /// Return the exclusive upper bound of any `LoopVar` inside this expression
+    /// (`1` if the expression does not reference an inner loop counter).
+    pub fn loop_bound(&self) -> u64 {
+        match self {
+            Self::LoopVar { bound } => *bound,
+            Self::Tx | Self::Ty | Self::Const(_) => 1,
+            Self::Add(a, b) | Self::Mul(a, b) => a.loop_bound().max(b.loop_bound()),
+            Self::Div(a, _) | Self::Mod(a, _) => a.loop_bound(),
+        }
+    }
+
+    /// Match `self` against `coord * stride` or `stride * coord`, returning `(coord, stride)`.
+    fn as_scaled(expr: &Self) -> Option<(&Self, u64)> {
+        match expr {
+            Self::Mul(lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+                (inner, Self::Const(s)) | (Self::Const(s), inner) if *s > 0 => Some((inner, *s)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Classify this [`IdxExpr`] into a named [`TileAccessPatternKind`] shortcut when
+    /// it matches one of the standard patterns, or [`TileAccessPatternKind::Expr`] for
+    /// any general index formula.
+    pub fn classify_pattern(&self, block_size: u32) -> (TileAccessPatternKind, u64) {
+        match self {
+            Self::Tx => (
+                TileAccessPatternKind::ThreadSlot {
+                    stride: u64::from(block_size),
+                },
+                1,
+            ),
+            Self::LoopVar { bound } => (TileAccessPatternKind::LinearScan, *bound),
+            Self::Div(inner, group_size) if **inner == Self::Tx && *group_size > 0 => (
+                TileAccessPatternKind::GroupSlot {
+                    group_size: *group_size,
+                },
+                1,
+            ),
+            Self::Mod(inner, group_size) if **inner == Self::Tx && *group_size > 0 => (
+                TileAccessPatternKind::GroupLaneScan {
+                    group_size: *group_size,
+                    pack: 1,
+                },
+                1,
+            ),
+            _ => {
+                if let Some((inner, pack)) = Self::as_scaled(self) {
+                    if *inner == Self::Tx {
+                        return (TileAccessPatternKind::PackedSlot { pack }, 1);
+                    }
+                    if let Self::Mod(base, group_size) = inner
+                        && **base == Self::Tx
+                    {
+                        return (
+                            TileAccessPatternKind::GroupLaneScan {
+                                group_size: *group_size,
+                                pack,
+                            },
+                            1,
+                        );
+                    }
+                }
+                if let Self::Add(lhs, rhs) = self {
+                    for (scaled_side, other_side) in
+                        [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
+                    {
+                        if let Some((row_coord, stride)) = Self::as_scaled(scaled_side) {
+                            match (row_coord, other_side) {
+                                (Self::Ty, Self::Tx) => {
+                                    return (TileAccessPatternKind::ThreadSlot { stride }, 1);
+                                }
+                                (Self::Ty, Self::LoopVar { bound }) => {
+                                    return (TileAccessPatternKind::RowScan { stride }, *bound);
+                                }
+                                (Self::LoopVar { bound }, Self::Tx) => {
+                                    return (TileAccessPatternKind::ColScan { stride }, *bound);
+                                }
+                                (Self::Tx, Self::LoopVar { bound }) => {
+                                    return (
+                                        TileAccessPatternKind::PackedSlot { pack: stride },
+                                        *bound,
+                                    );
+                                }
+                                (Self::Tx, Self::Const(c)) => {
+                                    return (
+                                        TileAccessPatternKind::PackedSlot { pack: stride },
+                                        c.saturating_add(1),
+                                    );
+                                }
+                                (Self::Mod(b, group_size), Self::LoopVar { bound })
+                                    if **b == Self::Tx =>
+                                {
+                                    return (
+                                        TileAccessPatternKind::GroupLaneScan {
+                                            group_size: *group_size,
+                                            pack: stride,
+                                        },
+                                        *bound,
+                                    );
+                                }
+                                (Self::Mod(b, group_size), Self::Const(c)) if **b == Self::Tx => {
+                                    return (
+                                        TileAccessPatternKind::GroupLaneScan {
+                                            group_size: *group_size,
+                                            pack: stride,
+                                        },
+                                        c.saturating_add(1),
+                                    );
+                                }
+                                (Self::Div(b1, g1), Self::Mod(b2, g2))
+                                    if **b1 == Self::Tx && **b2 == Self::Tx && g1 == g2 =>
+                                {
+                                    return (
+                                        TileAccessPatternKind::BitSplitSlot {
+                                            group_size: *g1,
+                                            stride,
+                                        },
+                                        1,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                (TileAccessPatternKind::Expr(self.clone()), self.loop_bound())
+            }
+        }
+    }
+}
+
+/// Compositional boolean branch condition guarding a basic block.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GuardExpr {
+    /// Unguarded (`True`).
+    True,
+    /// Strict upper bound `lhs < rhs` (e.g. `tid < 64`).
+    Lt(IdxExpr, IdxExpr),
+    /// Lower bound `lhs >= rhs` (from `!(lhs < rhs)` or `mir.ge`).
+    Ge(IdxExpr, IdxExpr),
+    /// Equality `lhs == rhs` (e.g. `lane == 0` or `lane == 7`).
+    Eq(IdxExpr, IdxExpr),
+    /// Inequality `lhs != rhs` (from `!(lhs == rhs)` or `mir.ne`).
+    Ne(IdxExpr, IdxExpr),
+    /// Conjunction of two dominating branch guards (`p /\ q`).
+    And(Box<GuardExpr>, Box<GuardExpr>),
+}
+
+impl GuardExpr {
+    /// Logical negation of a branch condition (`mir.not` or false branch of `mir.cond_br`).
+    pub fn negate(&self) -> Self {
+        match self {
+            Self::True => Self::True,
+            Self::Lt(a, b) => Self::Ge(a.clone(), b.clone()),
+            Self::Ge(a, b) => Self::Lt(a.clone(), b.clone()),
+            Self::Eq(a, b) => Self::Ne(a.clone(), b.clone()),
+            Self::Ne(a, b) => Self::Eq(a.clone(), b.clone()),
+            Self::And(_, _) => Self::True,
+        }
+    }
+
+    /// Conjoin two branch guards, simplifying trivial `GuardExpr::True` operands.
+    pub fn and(self, other: Self) -> Self {
+        match (&self, &other) {
+            (Self::True, _) => other,
+            (_, Self::True) => self,
+            _ if self == other => self,
+            _ => Self::And(Box::new(self), Box::new(other)),
+        }
+    }
+
+    /// Return true if this guard includes a zero-lane leader check (`tx % G == 0` or `tx == 0`).
+    pub fn has_zero_leader_check(&self) -> bool {
+        match self {
+            Self::Eq(lhs, rhs) => {
+                matches!(
+                    (lhs, rhs),
+                    (IdxExpr::Mod(b, _), IdxExpr::Const(0))
+                        | (IdxExpr::Const(0), IdxExpr::Mod(b, _))
+                        if **b == IdxExpr::Tx
+                ) || matches!(
+                    (lhs, rhs),
+                    (IdxExpr::Tx, IdxExpr::Const(0)) | (IdxExpr::Const(0), IdxExpr::Tx)
+                )
+            }
+            Self::And(p, q) => p.has_zero_leader_check() || q.has_zero_leader_check(),
+            _ => false,
+        }
+    }
+
+    /// Extract the tightest `tx < bound` upper bound implied by this guard (defaulting to `default_bound`).
+    pub fn active_threads_bound(&self, default_bound: u64) -> u64 {
+        match self {
+            Self::Lt(IdxExpr::Tx, IdxExpr::Const(bound)) => default_bound.min(*bound),
+            Self::And(p, q) => p
+                .active_threads_bound(default_bound)
+                .min(q.active_threads_bound(default_bound)),
+            _ => default_bound,
+        }
+    }
+
+    /// Extract any conjuncts that are not already represented by `active_threads` (`tx < N`)
+    /// or `leader_only` (`tx % G == 0` / `tx == 0`).
+    pub fn custom_residual(&self) -> Self {
+        match self {
+            Self::True => Self::True,
+            Self::Lt(IdxExpr::Tx, IdxExpr::Const(_)) => Self::True,
+            Self::Eq(_, _) if self.has_zero_leader_check() => Self::True,
+            Self::And(p, q) => p.custom_residual().and(q.custom_residual()),
+            other => other.clone(),
+        }
+    }
+}
+
+/// How threads in a block index into a shared-memory array (`SharedArray`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TileAccessPatternKind {
-    /// Per-thread unique slot `ty * stride + tx`.
+    /// One fixed slot per thread (`TILE[ty * stride + tx]`).
     ThreadSlot {
         /// Row stride of the shared tile.
         stride: u64,
     },
-    /// Row scan `ty * stride + i` across loop step `i`.
+    /// Walk across row `ty`, one element per loop step `i` (`TILE[ty * stride + i]`).
     RowScan {
         /// Row stride of the shared tile.
         stride: u64,
     },
-    /// Column scan `i * stride + tx` down loop step `i`.
+    /// Walk down column `tx`, one element per loop step `i` (`TILE[i * stride + tx]`).
     ColScan {
         /// Row stride of the shared tile.
         stride: u64,
     },
-    /// Sub-group / warp slot `tx / group_size` (e.g. `WARP_SUMS[tid / 32]`).
+    /// One slot per warp or sub-warp team of `group_size` threads (`WARP_SUMS[tx / group_size]`).
     GroupSlot {
         /// Number of threads per group (`32` for a warp, `16` for a half-warp).
         group_size: u64,
     },
-    /// Linear 1D scan `i` across loop step `i` (`0 <= i < loop_bound`).
+    /// Walk straight across a 1D array, one element per loop step `i` (`WARP_SUMS[i]`).
     LinearScan,
+    /// A contiguous chunk of `pack` slots owned by each thread `tx` (`S_X[tx * pack + i]`).
+    PackedSlot {
+        /// Number of contiguous elements owned by each thread `tx`.
+        pack: u64,
+    },
+    /// A chunk of `pack` slots indexed by a thread's lane `tx % group_size` inside its sub-warp (`S_XS[(tx % group_size) * pack + i]`).
+    GroupLaneScan {
+        /// Number of threads per sub-warp / group (`16`, `32`, ...).
+        group_size: u64,
+        /// Number of elements scanned per lane (`1`, `4`, `16`, ...).
+        pack: u64,
+    },
+    /// A 1D thread ID `tx` split into a 2D `(row = tx / group_size, col = tx % group_size)` cell (`TILE[(tx / group_size) * stride + (tx % group_size)]`).
+    BitSplitSlot {
+        /// Sub-warp width (`2^k`, e.g. `16`).
+        group_size: u64,
+        /// Row stride in shared memory (`stride >= group_size`).
+        stride: u64,
+    },
+    /// General compositional index expression `IdxExpr` built from SSA operations.
+    Expr(IdxExpr),
 }
 
 /// 2D global slice strip indexing shape in a tiled 2D kernel (`sgemm_tiled_raw`).
@@ -158,29 +431,10 @@ pub enum SsaKind {
     },
     /// Boolean test `discriminant == 0` (`Option::is_none`).
     OptionIsNone,
-    /// 2D block thread index `threadIdx.x` (`0 <= tx < blockDim.x`).
-    TidX,
-    /// 2D block thread index `threadIdx.y` (`0 <= ty < blockDim.y`).
-    TidY,
-    /// Inner tile scan loop counter `i` bounded by `0 <= i < bound`.
-    LoopStep {
-        /// Exclusive upper bound on `i` from `while i < bound`.
-        bound: u64,
-    },
-    /// Stride product `ty * stride` or `i * stride` in a 2D tile coordinate.
-    TileRowScaled {
-        /// Whether the row term is `TidY` (`None`) or `LoopStep { bound }` (`Some(bound)`).
-        loop_bound: Option<u64>,
-        /// Constant row stride.
-        stride: u64,
-    },
-    /// Linear 2D shared-memory tile index (`ty * W + tx`, `ty * W + i`, or `i * W + tx`).
-    TileCoord2D {
-        /// 2D indexing pattern.
-        pattern: TileAccessPatternKind,
-        /// Exclusive upper bound on `i` (`1` for `ThreadSlot`).
-        loop_bound: u64,
-    },
+    /// Compositional symbolic index expression (`tx`, `ty`, `i`, `+`, `*`, `/`, `%`).
+    Index(IdxExpr),
+    /// Compositional boolean branch or bounds guard (`<`, `>=`, `==`, `!=`).
+    Guard(GuardExpr),
     /// Base pointer to a static `SharedArray<T, N>` allocation.
     SharedBasePtr {
         /// Index of the `SharedArray` static (`0`, `1`, ...).
@@ -188,25 +442,29 @@ pub enum SsaKind {
         /// Number of elements in the `SharedArray`.
         size: u64,
     },
-    /// Boolean bounds test `tile_coord < size` on a `SharedArray`.
-    SharedIndexLtLen {
-        /// Constant element count compared against.
-        size: u64,
-        /// 2D indexing pattern.
-        pattern: TileAccessPatternKind,
-        /// Exclusive upper bound on `i`.
-        loop_bound: u64,
+    /// Pointer to a static `Barrier` (`mbarrier`) allocation in shared memory.
+    MbarrierPtr {
+        /// Deterministic index of the `Barrier` static (`0`, `1`, ...).
+        bar_id: usize,
     },
-    /// Element pointer `&TILE[tile_coord]` into a `SharedArray`.
+    /// Boolean completion predicate returned by `mbarrier_try_wait` or `mbarrier_try_wait_parity`.
+    MbarrierReady {
+        /// Index of the awaited `Barrier` static (`0`, `1`, ...).
+        bar_id: usize,
+    },
+    /// Negated `mbarrier` wait predicate (`!mbarrier_try_wait*`).
+    MbarrierNotReady {
+        /// Index of the awaited `Barrier` static (`0`, `1`, ...).
+        bar_id: usize,
+    },
+    /// Element pointer `&TILE[addr]` into a `SharedArray`.
     SharedElementPtr {
         /// Index of the `SharedArray` static (`0`, `1`, ...).
         shared_id: usize,
         /// Number of elements in the `SharedArray`.
         size: u64,
-        /// 2D indexing pattern.
-        pattern: TileAccessPatternKind,
-        /// Exclusive upper bound on `i`.
-        loop_bound: u64,
+        /// Compositional index expression used to offset into the `SharedArray`.
+        addr: IdxExpr,
     },
     /// 2D global row-strip index `start + col` (derived from `tx` without runtime stride multiply).
     StripColOffset,
@@ -220,21 +478,6 @@ pub enum SsaKind {
         param: usize,
         /// Row-strip (`start + col`) vs. column-strip (`start + row * stride`) pattern.
         kind: GlobalStripKind,
-    },
-    /// Remainder `tx % group_size` or `warp::lane_id()` (`group_size = 32`).
-    GroupLaneRem {
-        /// Number of threads in the group.
-        group_size: u64,
-    },
-    /// Boolean test `(tx % group_size) == 0` (`lane == 0`).
-    IsGroupLeader {
-        /// Number of threads in the group.
-        group_size: u64,
-    },
-    /// Boolean negation `(tx % group_size) != 0` (`lane != 0`).
-    IsNotGroupLeader {
-        /// Number of threads in the group.
-        group_size: u64,
     },
     /// Loaded element or arithmetic value that does not affect indexing.
     DataValue,

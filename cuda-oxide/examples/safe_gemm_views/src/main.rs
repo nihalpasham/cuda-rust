@@ -5,13 +5,13 @@
 
 #![allow(clippy::too_many_arguments)]
 
-//! SGEMM through read-side proof-carrying views + Lean 4 shared-memory
-//! verification (`#[verify(...)]`), beside raw-pointer twins.
+//! Provably safe 2D SGEMM through read-side proof-carrying views + Lean 4
+//! shared-memory safety proofs (`#[verify(...)]`), beside raw-pointer twins.
 //!
 //! `C = alpha * A * B + beta * C` with runtime dimensions `m`, `n`, `k`.
 //! The safe kernels check each input strip once up front
 //! (`MatrixView32::row` / `col`), while `sgemm_tiled_views` additionally
-//! verifies `no_oob_idx(TILE_A, TILE_B)`, `no_data_race(TILE_A, TILE_B)`,
+//! proves `no_oob_idx(TILE_A, TILE_B)`, `no_data_race(TILE_A, TILE_B)`,
 //! and `uniform_barriers` in Lean 4 at `PostMem2Reg`.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig2D};
@@ -220,7 +220,7 @@ mod kernels {
 
             let a_value = a_row.get(tile_start.wrapping_add(tx)).unwrap_or(0.0);
             let b_value = b_col.get(tile_start.wrapping_add(ty)).unwrap_or(0.0);
-            // Phase 0 (Lean-verified `no_oob_idx` + `no_data_race`):
+            // Phase 0 (provably safe `no_oob_idx` + `no_data_race`):
             // Each thread stages its own unique slot `smem_idx = ty * 16 + tx < 256`
             // under the contracted (16, 16, 1) block.
             {
@@ -230,7 +230,7 @@ mod kernels {
 
             thread::sync_threads();
 
-            // Phase 1 (Lean-verified `no_oob_idx` + `no_data_race` + `uniform_barriers`):
+            // Phase 1 (provably safe `no_oob_idx` + `no_data_race` + `uniform_barriers`):
             // Barrier #1 separates Phase 0 writes from Phase 1 reads, and `ty`, `i`, `tx`
             // are all `< 16` so `ty * 16 + i < 256` and `i * 16 + tx < 256`.
             {
@@ -316,7 +316,7 @@ mod kernels {
             } else {
                 0.0
             };
-            // Phase 0 (Lean-verified `no_oob_idx` + `no_data_race`):
+            // Phase 0 (provably safe `no_oob_idx` + `no_data_race`):
             // Each thread stages its own unique slot `smem_idx = ty * 16 + tx < 256`.
             {
                 TILE_A[smem_idx] = a_value;
@@ -325,7 +325,7 @@ mod kernels {
 
             thread::sync_threads();
 
-            // Phase 1 (Lean-verified `no_oob_idx` + `no_data_race` + `uniform_barriers`):
+            // Phase 1 (provably safe `no_oob_idx` + `no_data_race` + `uniform_barriers`):
             // Barrier #1 separates Phase 0 writes from Phase 1 reads (`< 256`).
             {
                 let mut i = 0usize;
@@ -410,7 +410,7 @@ fn bench() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    println!("verified_gemm_views bench: {BM}x{BN}x{BK}, {NUM_RUNS} timed runs");
+    println!("safe_gemm_views bench: {BM}x{BN}x{BK}, {NUM_RUNS} timed runs");
     time_runs(&stream, "naive views (safe)", flops, || {
         module.sgemm_naive_views(
             &stream,
@@ -623,7 +623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bench()?;
 
     println!();
-    println!("=== Lean-Verified 2D Tiled SGEMM (`verified_gemm_views`) ===\n");
+    println!("=== Provably Safe 2D Tiled SGEMM (`safe_gemm_views`) ===\n");
     println!("Contract & Lean 4 Proof Summary:");
     println!("  • Launch contract:   domain = 2, block = (16, 16, 1)");
     println!("  • Host requires:     k >= 1, a.len() >= m * k, b.len() >= k * n, c.len() >= m * n");

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // PostMem2Reg dialect-mir fixture for verified 2D phased shared-memory tiled SGEMM.
-builtin.module @verified_gemm_views {
+builtin.module @safe_gemm_views {
   ^entry():
     mir.func @sgemm_tiled_views: builtin.function <(builtin.integer ui32, builtin.integer ui32, builtin.integer ui32, builtin.fp32, mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>, mir.slice <builtin.fp32 ,mutable:false,kind:SharedRef>, builtin.fp32, mir.disjoint_slice <builtin.fp32 ,[builtin.integer ui32]>) -> ()>
       [gpu_kernel: builtin.string "true", launch_contract_domain: builtin.integer <2: ui32>, reqntid_x: builtin.integer <16: ui32>, reqntid_y: builtin.integer <16: ui32>, reqntid_z: builtin.integer <1: ui32>, verify_no_data_race: builtin.string "0,1", verify_no_oob_shared: builtin.string "0,1", verify_uniform_barriers: builtin.string "true"]

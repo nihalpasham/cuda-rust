@@ -1,5 +1,5 @@
 [package]
-name = "verified_warp_reduce"
+name = "safe_vecadd"
 version = "0.1.0"
 edition = "2024"
 authors = ["Nihal Pasham <nihalp@nvidia.com>"]

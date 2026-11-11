@@ -22,6 +22,8 @@ const FIXTURE: &str = include_str!("../fixtures/arithmetic.mir");
 const VECADD_FIXTURE: &str = include_str!("../fixtures/vecadd.mir");
 const SGEMM_TILED_FIXTURE: &str = include_str!("../fixtures/sgemm_tiled.mir");
 const WARP_REDUCE_FIXTURE: &str = include_str!("../fixtures/warp_reduce.mir");
+const SUBWARP_MULTIBUF_FIXTURE: &str = include_str!("../fixtures/subwarp_multibuf.mir");
+const ASYNC_COPY_FIXTURE: &str = include_str!("../fixtures/async_copy_stage.mir");
 
 fn export(source: &str) -> String {
     export_named_source(source, "global_index").expect("valid scalar MIR")
@@ -344,7 +346,7 @@ fn cli_inspect_shows_the_exact_input_and_export_only_after_success() {
 }
 
 #[test]
-fn exports_verified_vecadd_kernel_and_rejects_unguarded_accesses() {
+fn exports_safe_vecadd_kernel_and_rejects_unguarded_accesses() {
     let lean = export_named_source(VECADD_FIXTURE, "vecadd").expect("valid verified vecadd MIR");
     assert!(lean.contains("def kernelSummary : CudaOxide.Mir.Kernel.KernelSummary1D 3"));
     assert!(lean.contains("theorem verify_no_oob_idx_param0"));
@@ -646,5 +648,174 @@ fn verifies_stage3_warp_and_block_reductions_and_rejects_missing_leader_guard() 
     assert!(
         err.to_string().contains("omega could not prove the goal"),
         "unexpected Lean error for missing `lane == 0` guard: {err}"
+    );
+}
+
+#[test]
+fn verifies_stage4_subwarp_bit_splits_and_multibuffer_shared_staging() {
+    let lean_dir = lean_exporter::runner::default_lean_package_dir();
+
+    // 1. Sub-warp 16x16 bit-split staging `(tid >> 4) * 16 + (tid & 15)` + lane scan `(tid & 15) * 16 + j`
+    let split_lean = export_named_source(SUBWARP_MULTIBUF_FIXTURE, "subwarp_bit_split_stage")
+        .expect("valid subwarp_bit_split_stage MIR");
+    assert!(split_lean.contains(".bitSplitSlot 16 16"));
+    assert!(split_lean.contains(".groupLaneScan 16 16"));
+    assert!(split_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_bit_split_slot"));
+    assert!(split_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_group_lane_scan"));
+    assert!(split_lean.contains("CudaOxide.Proofs.Launch.no_data_race_bit_split_slot"));
+    lean_exporter::runner::check_generated_lean(&split_lean, &lean_dir)
+        .expect("valid subwarp_bit_split_stage MIR must pass Lean 4 verification");
+
+    // 2. 3-phase, 3-buffer (`S_ACT_DIRECT`, `S_XS_DIRECT`, `S_X_DIRECT`) sub-warp staging
+    let multi_lean = export_named_source(SUBWARP_MULTIBUF_FIXTURE, "multibuf_subwarp_stage")
+        .expect("valid multibuf_subwarp_stage MIR");
+    assert!(multi_lean.contains("numBarriers := 2"));
+    assert!(multi_lean.contains(".packedSlot 4"));
+    assert!(multi_lean.contains(".groupLaneScan 16 4"));
+    assert!(multi_lean.contains(".groupLaneScan 16 16"));
+    assert!(multi_lean.contains(".groupSlot 16"));
+    assert!(multi_lean.contains("phase := 2"));
+    assert!(multi_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_1d_slot"));
+    assert!(multi_lean.contains("CudaOxide.Proofs.Bounds.no_oob_tile_packed_slot"));
+    assert!(multi_lean.contains("CudaOxide.Proofs.Launch.no_data_race_packed_slot"));
+    lean_exporter::runner::check_generated_lean(&multi_lean, &lean_dir)
+        .expect("valid multibuf_subwarp_stage MIR must pass Lean 4 verification");
+
+    // 3. Negative check A: Widening `if tid < 64` to `if tid < 128` in Phase 0 causes
+    // `S_XS_DIRECT[tid]` (`size = 64`) and `S_X_DIRECT[tid * 4 + w]` (`size = 256`) to go OOB!
+    let bad_active_guard = SUBWARP_MULTIBUF_FIXTURE.replacen(
+        "c64 = mir.constant () [] [value: builtin.integer <64: ui64>]",
+        "c64 = mir.constant () [] [value: builtin.integer <128: ui64>]",
+        1,
+    );
+    let bad_guard_lean = export_named_source(&bad_active_guard, "multibuf_subwarp_stage")
+        .expect("exports widened active-thread guard obligation");
+    let err = lean_exporter::runner::check_generated_lean(&bad_guard_lean, &lean_dir)
+        .expect_err("Lean must reject `if tid < 128` OOB access on 64-element S_XS_DIRECT and 256-element S_X_DIRECT");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for widened `if tid < 128` guard: {err}"
+    );
+
+    // 4. Negative check B: Removing the second `nvvm.barrier0` (`^barrier_1`) between Phase 1
+    // leader write `S_ACT_DIRECT[m_local]` and Phase 2 read `S_ACT_DIRECT[tid]` collapses
+    // both into Phase 1 and fails `NoDataRace`!
+    let missing_second_barrier = SUBWARP_MULTIBUF_FIXTURE.replace(
+        "      ^barrier_1():\n        nvvm.barrier0 () [] []: <() -> ()>;",
+        "      ^barrier_1():",
+    );
+    let missing_bar1_lean = export_named_source(&missing_second_barrier, "multibuf_subwarp_stage")
+        .expect("exports phase-collapsed obligation on S_ACT_DIRECT");
+    let err = lean_exporter::runner::check_generated_lean(&missing_bar1_lean, &lean_dir)
+        .expect_err(
+            "Lean must reject missing second `sync_threads()` before Phase 2 read of S_ACT_DIRECT",
+        );
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing second barrier: {err}"
+    );
+
+    // 5. Negative check C: Overlapping packed loop bound (`w < 8` instead of `w < 4` on `tid * 4 + w`)
+    // causes thread `tid = 0, w = 4` and thread `tid = 1, w = 0` to race on `S_X_DIRECT[4]`!
+    let overlapping_pack = SUBWARP_MULTIBUF_FIXTURE.replace(
+        "in_pack = mir.lt (w, c4)",
+        "c8_bad = mir.constant () [] [value: builtin.integer <8: ui64>]: <() -> (builtin.integer ui64)>;\n        in_pack = mir.lt (w, c8_bad)",
+    );
+    let overlapping_lean = export_named_source(&overlapping_pack, "multibuf_subwarp_stage")
+        .expect("exports overlapping packed-slot obligation");
+    let err = lean_exporter::runner::check_generated_lean(&overlapping_lean, &lean_dir)
+        .expect_err("Lean must reject overlapping `tid * 4 + w` with `w < 8`");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for overlapping packed write: {err}"
+    );
+
+    // 6. General `GuardExpr` test: Non-zero leader lane (`if k_lane == 7` instead of `0`)
+    // emits `guard := (.eq (.mod .tx 16) (.const 7))` and is proved race-free by `GuardExpr.eval` + `omega`!
+    let lane_seven_leader = SUBWARP_MULTIBUF_FIXTURE.replace(
+        "zero_lane = mir.constant () [] [value: builtin.integer <0: ui64>]",
+        "zero_lane = mir.constant () [] [value: builtin.integer <7: ui64>]",
+    );
+    let lane_seven_lean = export_named_source(&lane_seven_leader, "multibuf_subwarp_stage")
+        .expect("exports GuardExpr for `k_lane == 7`");
+    assert!(lane_seven_lean.contains("guard := (.eq (.mod .tx 16) (.const 7))"));
+    lean_exporter::runner::check_generated_lean(&lane_seven_lean, &lean_dir)
+        .expect("Lean must prove `NoDataRace` for arbitrary leader lane `k_lane == 7`");
+
+    // 7. General `IdxExpr` test: Multi-level index expression `(w * 64 + tid) + 0` (outside the
+    // 8 named templates) emits `.expr (.add (.add (.mul .loopVar (.const 64)) .tx) (.const 0))`
+    // with `guard := (.lt .tx (.const 64))` and is proved in-bounds and race-free by
+    // `IdxExpr.eval` + `GuardExpr.eval` + `omega`!
+    let coalesced_strided = SUBWARP_MULTIBUF_FIXTURE.replace(
+        "tid_x4 = mir.mul (tid_u64, c4) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;\n        pack_idx = mir.add (tid_x4, w)",
+        "w_x64 = mir.mul (w, c64) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;\n        w_tid = mir.add (w_x64, tid_u64) [] []: <(builtin.integer ui64, builtin.integer ui64) -> (builtin.integer ui64)>;\n        pack_idx = mir.add (w_tid, zero_w)",
+    );
+    let coalesced_lean = export_named_source(&coalesced_strided, "multibuf_subwarp_stage")
+        .expect("exports general `.expr` for coalesced `(w * 64 + tid) + 0`");
+    assert!(
+        coalesced_lean.contains(".expr (.add (.add (.mul .loopVar (.const 64)) .tx) (.const 0))")
+    );
+    lean_exporter::runner::check_generated_lean(&coalesced_lean, &lean_dir)
+        .expect("Lean must prove `NoOobTileAccess` and `NoDataRace` for general `.expr` `(w * 64 + tid) + 0`");
+}
+
+#[test]
+fn verifies_stage5_async_copy_and_mbarrier_token_ordering() {
+    let lean_dir = lean_exporter::runner::default_lean_package_dir();
+
+    // 1. Valid Stage 5 async TMA copy + `mbarrier_arrive_expect_tx` + `mbarrier_try_wait_parity`
+    let async_lean = export_named_source(ASYNC_COPY_FIXTURE, "async_copy_stage")
+        .expect("valid async_copy_stage MIR");
+    assert!(async_lean.contains("numBarriers := 2"));
+    assert!(async_lean.contains("CudaOxide.Proofs.Launch.no_data_race_single_leader"));
+    assert!(async_lean.contains("CudaOxide.Proofs.Launch.no_data_race_diff_phase"));
+    lean_exporter::runner::check_generated_lean(&async_lean, &lean_dir)
+        .expect("valid async_copy_stage MIR must pass Lean 4 verification");
+
+    // 2. Negative check A: Bypassing `while !mbarrier_try_wait_parity(&BAR, 0) {}`
+    // (jumping straight from `^sync_after_init` / `^issue_tma` to `^consume_tile` without waiting)
+    // leaves `StageReady` false, so the read stays in Phase 1 with `cp_async_bulk` and fails `NoDataRace`!
+    let missing_wait = ASYNC_COPY_FIXTURE.replace(
+        "mir.cond_br (not_ready) [^wait_spin, ^consume_tile] [builtin_operand_segment_sizes: builtin.operand_segment_sizes [1, 0, 0]]: <(builtin.integer i1) -> ()>",
+        "mir.goto () [^consume_tile] []: <() -> ()>",
+    );
+    let missing_wait_lean = export_named_source(&missing_wait, "async_copy_stage")
+        .expect("exports unawaited async copy obligation");
+    let err = lean_exporter::runner::check_generated_lean(&missing_wait_lean, &lean_dir)
+        .expect_err("Lean must reject reading TILE without waiting on mbarrier_try_wait_parity");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing mbarrier wait: {err}"
+    );
+
+    // 3. Negative check B: Omitting `mbarrier_arrive_expect_tx_shared` leaves the barrier
+    // unarmed (`StageProduced` incomplete), so `StageReady` never unlocks and `NoDataRace` fails!
+    let missing_arrive = ASYNC_COPY_FIXTURE
+        .lines()
+        .filter(|line| !line.contains("mbarrier_arrive_expect_tx_shared"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let missing_arrive_lean = export_named_source(&missing_arrive, "async_copy_stage")
+        .expect("exports unarmed mbarrier obligation");
+    let err = lean_exporter::runner::check_generated_lean(&missing_arrive_lean, &lean_dir)
+        .expect_err("Lean must reject mbarrier wait when mbarrier_arrive_expect_tx was omitted");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for missing mbarrier_arrive_expect_tx: {err}"
+    );
+
+    // 4. Negative check C: Waiting on a DIFFERENT barrier (`BAR_OTHER` instead of `BAR`)
+    // does not unlock `TILE` (which was bound to `BAR`), so `NoDataRace` fails in Lean!
+    let wrong_barrier = ASYNC_COPY_FIXTURE.replace(
+        "bar_wait_raw = mir.shared_alloc () [] [elem_type: builtin.type builtin.integer ui64, size: builtin.integer <1: i64>, alloc_key: builtin.string \"BAR\", source_name: builtin.string \"safe_async_copy::kernels::async_copy_stage::BAR\"]",
+        "bar_wait_raw = mir.shared_alloc () [] [elem_type: builtin.type builtin.integer ui64, size: builtin.integer <1: i64>, alloc_key: builtin.string \"BAR_OTHER\", source_name: builtin.string \"safe_async_copy::kernels::async_copy_stage::BAR_OTHER\"]",
+    );
+    let wrong_bar_lean = export_named_source(&wrong_barrier, "async_copy_stage")
+        .expect("exports mismatched mbarrier obligation");
+    let err = lean_exporter::runner::check_generated_lean(&wrong_bar_lean, &lean_dir)
+        .expect_err("Lean must reject waiting on BAR_OTHER when cp_async_bulk used BAR");
+    assert!(
+        err.to_string().contains("omega could not prove the goal"),
+        "unexpected Lean error for wrong mbarrier wait: {err}"
     );
 }

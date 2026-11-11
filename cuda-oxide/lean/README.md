@@ -69,7 +69,7 @@ Run from the `cuda-oxide/` workspace directory:
 
 ```bash
 # 1. Build and run the end-to-end verified vecadd example on the GPU:
-cargo oxide run verified_vecadd
+cargo oxide run safe_vecadd
 
 # 2. Inspect exported Lean for the scalar MIR fixture or vecadd MIR fixture:
 cargo oxide lean-export

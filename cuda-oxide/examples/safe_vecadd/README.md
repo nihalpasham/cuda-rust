@@ -3,11 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Verified 1D Vector Addition (`verified_vecadd`)
+# Provably Safe 1D Vector Addition (`safe_vecadd`)
 
-Demonstrates end-to-end Lean 4 kernel verification at the `PostMem2Reg`
-`dialect-mir` stage combined with host-side `#[launch_contract]` precondition
-checking.
+Demonstrates a provably safe 1D GPU kernel in `cuda-oxide`, combining compile-time Lean 4 safety proofs at the `PostMem2Reg` `dialect-mir` stage with host-side `#[launch_contract]` precondition checking.
 
 ```text
   #[launch_contract(domain = 1, block = (256, 1, 1),
@@ -31,7 +29,7 @@ checking.
 From the `cuda-oxide/` directory:
 
 ```bash
-cargo oxide run verified_vecadd
+cargo oxide run safe_vecadd
 ```
 
 To inspect the exported Lean module and generated theorems directly:

@@ -16,6 +16,8 @@ SCALAR_FIXTURE = REPO / "crates/lean-exporter/fixtures/arithmetic.mir"
 VECADD_FIXTURE = REPO / "crates/lean-exporter/fixtures/vecadd.mir"
 SGEMM_TILED_FIXTURE = REPO / "crates/lean-exporter/fixtures/sgemm_tiled.mir"
 WARP_REDUCE_FIXTURE = REPO / "crates/lean-exporter/fixtures/warp_reduce.mir"
+SUBWARP_MULTIBUF_FIXTURE = REPO / "crates/lean-exporter/fixtures/subwarp_multibuf.mir"
+ASYNC_COPY_FIXTURE = REPO / "crates/lean-exporter/fixtures/async_copy_stage.mir"
 PROOFS = """
 namespace CudaOxide.Generated
 
@@ -214,7 +216,86 @@ def main():
             raise RuntimeError(f"Expected missing `lane == 0` guard to fail NoDataRace in Lean:\n{res_no_leader.stdout}")
         print("REJECTED as expected: missing `lane == 0` guard before `WARP_SUMS[tid / 32]` fails `no_data_race`.", flush=True)
 
-    print("Exporter checks passed for scalar, 1D vecadd, 2D SGEMM, and Stage 3 warp/block reduction fixtures.")
+        # Stage 4: Sub-warp bitwise coordinate splits & multi-buffer shared staging
+        subwarp_source = SUBWARP_MULTIBUF_FIXTURE.read_text()
+        split_lean = require_export(SUBWARP_MULTIBUF_FIXTURE, "subwarp_bit_split_stage")
+        split_valid = temporary / "SubwarpBitSplitValid.lean"
+        split_valid.write_text(split_lean)
+        require_success("env", "lean", str(split_valid))
+        print("PASS: exported subwarp_bit_split_stage MIR proves bit-split bijection and sub-warp lane scan.", flush=True)
+
+        multibuf_lean = require_export(SUBWARP_MULTIBUF_FIXTURE, "multibuf_subwarp_stage")
+        multibuf_valid = temporary / "MultibufSubwarpValid.lean"
+        multibuf_valid.write_text(multibuf_lean)
+        require_success("env", "lean", str(multibuf_valid))
+        print("PASS: exported multibuf_subwarp_stage MIR proves 3-phase multi-buffer S_X_DIRECT/S_XS_DIRECT/S_ACT_DIRECT staging.", flush=True)
+
+        # Mutate multibuf_subwarp_stage MIR by widening `if tid < 64` to `if tid < 128`:
+        bad_guard_mir = temporary / "multibuf_bad_guard.mir"
+        bad_guard_mir.write_text(
+            subwarp_source.replace(
+                "c64 = mir.constant () [] [value: builtin.integer <64: ui64>]",
+                "c64 = mir.constant () [] [value: builtin.integer <128: ui64>]",
+                1,
+            )
+        )
+        bad_guard_lean = require_export(bad_guard_mir, "multibuf_subwarp_stage")
+        bad_guard_file = temporary / "MultibufBadGuard.lean"
+        bad_guard_file.write_text(
+            "\n".join(line for line in bad_guard_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_bad_guard = run_lake("env", "lean", str(bad_guard_file))
+        if res_bad_guard.returncode == 0 or "error: omega could not prove the goal:" not in res_bad_guard.stdout:
+            raise RuntimeError(f"Expected widened `if tid < 128` guard to fail NoOobTileAccess in Lean:\n{res_bad_guard.stdout}")
+        print("REJECTED as expected: widening `if tid < 64` to `if tid < 128` fails `no_oob_idx` on `S_XS_DIRECT` and `S_X_DIRECT`.", flush=True)
+
+        # Mutate multibuf_subwarp_stage MIR by removing the second `nvvm.barrier0` (`^barrier_1`):
+        missing_bar2_mir = temporary / "multibuf_missing_bar2.mir"
+        missing_bar2_mir.write_text(
+            subwarp_source.replace(
+                "      ^barrier_1():\n        nvvm.barrier0 () [] []: <() -> ()>;",
+                "      ^barrier_1():",
+                1,
+            )
+        )
+        missing_bar2_lean = require_export(missing_bar2_mir, "multibuf_subwarp_stage")
+        missing_bar2_file = temporary / "MultibufMissingBar2.lean"
+        missing_bar2_file.write_text(
+            "\n".join(line for line in missing_bar2_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_missing_bar2 = run_lake("env", "lean", str(missing_bar2_file))
+        if res_missing_bar2.returncode == 0 or "error: omega could not prove the goal:" not in res_missing_bar2.stdout:
+            raise RuntimeError(f"Expected missing second barrier to fail NoDataRace on S_ACT_DIRECT in Lean:\n{res_missing_bar2.stdout}")
+        print("REJECTED as expected: missing second `sync_threads()` before Phase 2 read of `S_ACT_DIRECT` fails `no_data_race`.", flush=True)
+
+        # Stage 5: Async TMA copy + mbarrier token ordering
+        async_source = ASYNC_COPY_FIXTURE.read_text()
+        async_lean = require_export(ASYNC_COPY_FIXTURE, "async_copy_stage")
+        async_valid = temporary / "AsyncCopyValid.lean"
+        async_valid.write_text(async_lean)
+        require_success("env", "lean", str(async_valid))
+        print("PASS: exported async_copy_stage MIR proves mbarrier token-ordered TMA copy and consumer read.", flush=True)
+
+        # Mutate async_copy_stage MIR by bypassing `mbarrier_try_wait_parity`:
+        no_wait_mir = temporary / "async_copy_no_wait.mir"
+        no_wait_mir.write_text(
+            async_source.replace(
+                "mir.cond_br (not_ready) [^wait_spin, ^consume_tile] [builtin_operand_segment_sizes: builtin.operand_segment_sizes [1, 0, 0]]: <(builtin.integer i1) -> ()>",
+                "mir.goto () [^consume_tile] []: <() -> ()>",
+                1,
+            )
+        )
+        no_wait_lean = require_export(no_wait_mir, "async_copy_stage")
+        no_wait_file = temporary / "AsyncCopyNoWait.lean"
+        no_wait_file.write_text(
+            "\n".join(line for line in no_wait_lean.splitlines() if not line.startswith("#print axioms"))
+        )
+        res_no_wait = run_lake("env", "lean", str(no_wait_file))
+        if res_no_wait.returncode == 0 or "error: omega could not prove the goal:" not in res_no_wait.stdout:
+            raise RuntimeError(f"Expected bypassing mbarrier_try_wait_parity to fail NoDataRace in Lean:\n{res_no_wait.stdout}")
+        print("REJECTED as expected: reading `TILE` without `mbarrier_try_wait_parity` fails `no_data_race`.", flush=True)
+
+    print("Exporter checks passed for scalar, 1D vecadd, 2D SGEMM, Stage 3 warp/block reductions, Stage 4 sub-warp multi-buffer, and Stage 5 async mbarrier fixtures.")
 
 
 if __name__ == "__main__":

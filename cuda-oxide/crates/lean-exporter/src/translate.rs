@@ -45,7 +45,7 @@ use crate::{
         KernelVerificationSpec, get_string_attr, has_verification_attributes,
         parse_kernel_verification_spec,
     },
-    ssa::{GlobalStripKind, SsaEnv, SsaKind, TileAccessPatternKind},
+    ssa::{GlobalStripKind, GuardExpr, IdxExpr, SsaEnv, SsaKind, TileAccessPatternKind},
 };
 
 /// Direction of an extracted buffer access.
@@ -89,6 +89,10 @@ pub struct PhasedSharedAccess {
     pub loop_bound: u64,
     /// Whether this access is dominated by a leader guard (`lane == 0` / `tx % W == 0`).
     pub leader_only: bool,
+    /// Dominating upper bound on `tx` (`block_size` when unguarded, or `N` under `if tid < N`).
+    pub active_threads: u64,
+    /// Optional residual branch guard (`GuardExpr::True` when unguarded or covered by `leader_only` / `active_threads`).
+    pub guard: GuardExpr,
 }
 
 /// One 2D global slice strip access (`start + col` or `start + row * stride`)
@@ -944,6 +948,35 @@ fn int_attr_u64(attrs: &AttributeDict, key: &str) -> Option<u64> {
         })
 }
 
+/// Extract a compositional [`IdxExpr`] from an [`SsaKind`] when the operand is
+/// an index expression or an integer constant literal.
+fn as_idx_expr(kind: &SsaKind) -> Option<IdxExpr> {
+    match kind {
+        SsaKind::Index(expr) => Some(expr.clone()),
+        SsaKind::ConstInt { value, .. } => u64::try_from(*value).ok().map(IdxExpr::Const),
+        _ => None,
+    }
+}
+
+/// Return true if `op` is a `mir.shared_alloc` for a 64-bit hardware `Barrier` (`mbarrier`).
+fn is_mbarrier_shared_alloc(ctx: &Context, op: &Operation) -> bool {
+    let size = int_attr_u64(&op.attributes, "size").unwrap_or(0);
+    if size != 1 {
+        return false;
+    }
+    op.attributes.0.iter().any(|(k, v)| {
+        k.to_string() == "elem_type"
+            && v.downcast_ref::<TypeAttr>()
+                .and_then(|ta| {
+                    ta.get_type(ctx)
+                        .deref(ctx)
+                        .downcast_ref::<IntegerType>()
+                        .map(|i| i.width() == 64)
+                })
+                .unwrap_or(false)
+    })
+}
+
 /// Check if `start` can reach `target` in `succs` without passing through `forbidden`.
 fn can_reach_without(
     start: usize,
@@ -990,9 +1023,10 @@ fn translate_verified_2d_tiled_kernel(
         return Err(reject("kernel", "empty kernel region"));
     }
 
-    // 1. Discover all static `SharedArray` allocations (`mir.shared_alloc`) and
-    //    assign deterministic `0..N` IDs sorted by their short source identifier.
+    // 1. Discover all static `SharedArray` and `Barrier` (`mbarrier`) allocations
+    //    (`mir.shared_alloc`) and assign deterministic `0..N` IDs sorted by short name.
     let mut shared_raw_list: Vec<(String, u64)> = Vec::new();
+    let mut bar_raw_list: Vec<String> = Vec::new();
     for &b_ptr in &blocks {
         for op_ptr in b_ptr.deref(ctx).iter(ctx) {
             if Operation::get_opid(op_ptr, ctx).to_string() == "mir.shared_alloc" {
@@ -1004,14 +1038,21 @@ fn translate_verified_2d_tiled_kernel(
                     .next()
                     .unwrap_or(&full_name)
                     .to_string();
-                let size = int_attr_u64(&op.attributes, "size").unwrap_or(0);
-                if !shared_raw_list.iter().any(|(n, _)| n == &short) {
-                    shared_raw_list.push((short, size));
+                if is_mbarrier_shared_alloc(ctx, &op) {
+                    if !bar_raw_list.contains(&short) {
+                        bar_raw_list.push(short);
+                    }
+                } else {
+                    let size = int_attr_u64(&op.attributes, "size").unwrap_or(0);
+                    if !shared_raw_list.iter().any(|(n, _)| n == &short) {
+                        shared_raw_list.push((short, size));
+                    }
                 }
             }
         }
     }
     shared_raw_list.sort_by(|a, b| a.0.cmp(&b.0));
+    bar_raw_list.sort();
 
     // 2. Build the block adjacency list, locate `nvvm.barrier0` blocks, and
     //    find `mir.return` blocks.
@@ -1091,7 +1132,7 @@ fn translate_verified_2d_tiled_kernel(
         }
     }
 
-    let block_phase = |b_idx: usize, after_barrier_in_block: bool| -> usize {
+    let block_phase = |b_idx: usize, seen_barriers_in_block: usize| -> usize {
         if !barriers_uniform || barrier_blocks.is_empty() {
             return 0;
         }
@@ -1100,7 +1141,7 @@ fn translate_verified_2d_tiled_kernel(
             if barrier_blocks.len() >= 2 {
                 let b1 = barrier_blocks[1];
                 if b_idx == b0 {
-                    return usize::from(after_barrier_in_block);
+                    return usize::from(seen_barriers_in_block > 0);
                 }
                 if can_reach_without(b0, b_idx, b1, &succs, num_blocks) {
                     return 1;
@@ -1108,16 +1149,18 @@ fn translate_verified_2d_tiled_kernel(
             }
             0
         } else {
-            // Acyclic 1-barrier kernel (`Phase 0 -> sync_threads() -> Phase 1`):
-            if b_idx == b0 {
-                return usize::from(after_barrier_in_block);
-            }
-            if can_reach(b0, b_idx, &succs, num_blocks)
-                && !can_reach_without(0, b_idx, b0, &succs, num_blocks)
-            {
-                return 1;
-            }
-            0
+            // Acyclic N-barrier kernel (`Phase 0 -> sync_threads() -> Phase 1 -> ... -> Phase N`):
+            // Count every barrier in a distinct block `bk` that strictly dominates `b_idx`
+            // from entry `0`, plus any `nvvm.barrier0` ops already passed inside `b_idx`.
+            let dominating_barriers = barrier_blocks
+                .iter()
+                .filter(|&&bk| {
+                    bk != b_idx
+                        && can_reach(bk, b_idx, &succs, num_blocks)
+                        && !can_reach_without(0, b_idx, bk, &succs, num_blocks)
+                })
+                .count();
+            dominating_barriers + seen_barriers_in_block
         }
     };
 
@@ -1164,9 +1207,9 @@ fn translate_verified_2d_tiled_kernel(
                             update(
                                 &mut env,
                                 step_arg,
-                                SsaKind::LoopStep {
+                                SsaKind::Index(IdxExpr::LoopVar {
                                     bound: u64::try_from(bound).unwrap_or(u64::MAX),
-                                },
+                                }),
                             );
                         }
                     }
@@ -1177,16 +1220,16 @@ fn translate_verified_2d_tiled_kernel(
                 let op = op_ptr.deref(ctx);
                 match opid.as_str() {
                     "nvvm.read_ptx_sreg_tid_x" => {
-                        update(&mut env, op.get_result(0), SsaKind::TidX);
+                        update(&mut env, op.get_result(0), SsaKind::Index(IdxExpr::Tx));
                     }
                     "nvvm.read_ptx_sreg_tid_y" => {
-                        update(&mut env, op.get_result(0), SsaKind::TidY);
+                        update(&mut env, op.get_result(0), SsaKind::Index(IdxExpr::Ty));
                     }
                     "nvvm.read_ptx_sreg_laneid" => {
                         update(
                             &mut env,
                             op.get_result(0),
-                            SsaKind::GroupLaneRem { group_size: 32 },
+                            SsaKind::Index(IdxExpr::Mod(Box::new(IdxExpr::Tx), 32)),
                         );
                     }
                     "mir.call" => {
@@ -1195,7 +1238,7 @@ fn translate_verified_2d_tiled_kernel(
                             update(
                                 &mut env,
                                 op.get_result(0),
-                                SsaKind::GroupLaneRem { group_size: 32 },
+                                SsaKind::Index(IdxExpr::Mod(Box::new(IdxExpr::Tx), 32)),
                             );
                         } else if op.get_num_results() == 1 {
                             update(&mut env, op.get_result(0), SsaKind::DataValue);
@@ -1204,64 +1247,68 @@ fn translate_verified_2d_tiled_kernel(
                     "mir.div" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: g, .. }))
-                                if g > 0 =>
-                            {
-                                SsaKind::TileCoord2D {
-                                    pattern: TileAccessPatternKind::GroupSlot {
-                                        group_size: u64::try_from(g).unwrap_or(u64::MAX),
-                                    },
-                                    loop_bound: 1,
-                                }
-                            }
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(SsaKind::ConstInt { value: g, .. })) =
+                            (lhs.as_ref().and_then(as_idx_expr), rhs)
+                            && g > 0
+                            && a.has_coord()
+                        {
+                            SsaKind::Index(IdxExpr::Div(
+                                Box::new(a),
+                                u64::try_from(g).unwrap_or(u64::MAX),
+                            ))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.shr" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: sh, .. }))
-                                if sh < 16 =>
-                            {
-                                SsaKind::TileCoord2D {
-                                    pattern: TileAccessPatternKind::GroupSlot {
-                                        group_size: 1u64 << sh,
-                                    },
-                                    loop_bound: 1,
-                                }
-                            }
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(SsaKind::ConstInt { value: sh, .. })) =
+                            (lhs.as_ref().and_then(as_idx_expr), rhs)
+                            && sh < 16
+                            && a.has_coord()
+                        {
+                            SsaKind::Index(IdxExpr::Div(Box::new(a), 1u64 << sh))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.rem" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: g, .. }))
-                                if g > 0 =>
-                            {
-                                SsaKind::GroupLaneRem {
-                                    group_size: u64::try_from(g).unwrap_or(u64::MAX),
-                                }
-                            }
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(SsaKind::ConstInt { value: g, .. })) =
+                            (lhs.as_ref().and_then(as_idx_expr), rhs)
+                            && g > 0
+                            && a.has_coord()
+                        {
+                            SsaKind::Index(IdxExpr::Mod(
+                                Box::new(a),
+                                u64::try_from(g).unwrap_or(u64::MAX),
+                            ))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.bitand" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: m, .. }))
-                            | (Some(SsaKind::ConstInt { value: m, .. }), Some(SsaKind::TidX))
-                                if m > 0 && (m + 1).is_power_of_two() =>
+                        let mapped = match (&lhs, &rhs) {
+                            (Some(l), Some(SsaKind::ConstInt { value: m, .. }))
+                            | (Some(SsaKind::ConstInt { value: m, .. }), Some(l))
+                                if *m > 0 && (*m + 1).is_power_of_two() =>
                             {
-                                SsaKind::GroupLaneRem {
-                                    group_size: u64::try_from(m + 1).unwrap_or(u64::MAX),
+                                if let Some(a) = as_idx_expr(l)
+                                    && a.has_coord()
+                                {
+                                    SsaKind::Index(IdxExpr::Mod(
+                                        Box::new(a),
+                                        u64::try_from(*m + 1).unwrap_or(u64::MAX),
+                                    ))
+                                } else {
+                                    SsaKind::DataValue
                                 }
                             }
                             _ => SsaKind::DataValue,
@@ -1271,57 +1318,73 @@ fn translate_verified_2d_tiled_kernel(
                     "mir.eq" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (
-                                Some(SsaKind::GroupLaneRem { group_size }),
-                                Some(SsaKind::ConstInt { value: 0, .. }),
-                            )
-                            | (
-                                Some(SsaKind::ConstInt { value: 0, .. }),
-                                Some(SsaKind::GroupLaneRem { group_size }),
-                            ) => SsaKind::IsGroupLeader { group_size },
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: 0, .. }))
-                            | (Some(SsaKind::ConstInt { value: 0, .. }), Some(SsaKind::TidX)) => {
-                                SsaKind::IsGroupLeader {
-                                    group_size: u64::from(spec.block_size),
-                                }
-                            }
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && (a.has_coord() || b.has_coord())
+                        {
+                            SsaKind::Guard(GuardExpr::Eq(a, b))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.ne" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (
-                                Some(SsaKind::GroupLaneRem { group_size }),
-                                Some(SsaKind::ConstInt { value: 0, .. }),
-                            )
-                            | (
-                                Some(SsaKind::ConstInt { value: 0, .. }),
-                                Some(SsaKind::GroupLaneRem { group_size }),
-                            ) => SsaKind::IsNotGroupLeader { group_size },
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: 0, .. }))
-                            | (Some(SsaKind::ConstInt { value: 0, .. }), Some(SsaKind::TidX)) => {
-                                SsaKind::IsNotGroupLeader {
-                                    group_size: u64::from(spec.block_size),
-                                }
-                            }
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && (a.has_coord() || b.has_coord())
+                        {
+                            SsaKind::Guard(GuardExpr::Ne(a, b))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
                     "mir.not" => {
                         let inner = env.get_kind(&op.get_operand(0));
                         let mapped = match inner {
-                            Some(SsaKind::IsGroupLeader { group_size }) => {
-                                SsaKind::IsNotGroupLeader { group_size }
+                            Some(SsaKind::Guard(g)) => SsaKind::Guard(g.negate()),
+                            Some(SsaKind::MbarrierReady { bar_id }) => {
+                                SsaKind::MbarrierNotReady { bar_id }
                             }
-                            Some(SsaKind::IsNotGroupLeader { group_size }) => {
-                                SsaKind::IsGroupLeader { group_size }
+                            Some(SsaKind::MbarrierNotReady { bar_id }) => {
+                                SsaKind::MbarrierReady { bar_id }
                             }
                             _ => SsaKind::DataValue,
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "nvvm.mbarrier_try_wait_parity_shared"
+                    | "nvvm.mbarrier_try_wait_shared"
+                    | "nvvm.mbarrier_test_wait_shared"
+                    | "nvvm.mbarrier_try_wait_parity_cluster"
+                    | "nvvm.mbarrier_try_wait_parity_cluster_relaxed" => {
+                        let mapped = if op.get_num_operands() >= 1
+                            && let Some(SsaKind::MbarrierPtr { bar_id }) =
+                                env.get_kind(&op.get_operand(0))
+                        {
+                            SsaKind::MbarrierReady { bar_id }
+                        } else {
+                            SsaKind::DataValue
+                        };
+                        if op.get_num_results() == 1 {
+                            update(&mut env, op.get_result(0), mapped);
+                        }
+                    }
+                    "mir.ge" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && (a.has_coord() || b.has_coord())
+                        {
+                            SsaKind::Guard(GuardExpr::Ge(a, b))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
@@ -1352,16 +1415,21 @@ fn translate_verified_2d_tiled_kernel(
                             .next()
                             .unwrap_or(&full_name)
                             .to_string();
-                        let size = int_attr_u64(&op.attributes, "size").unwrap_or(0);
-                        let shared_id = shared_raw_list
-                            .iter()
-                            .position(|(n, _)| n == &short)
-                            .unwrap_or(0);
-                        update(
-                            &mut env,
-                            op.get_result(0),
-                            SsaKind::SharedBasePtr { shared_id, size },
-                        );
+                        if is_mbarrier_shared_alloc(ctx, &op) {
+                            let bar_id = bar_raw_list.iter().position(|n| n == &short).unwrap_or(0);
+                            update(&mut env, op.get_result(0), SsaKind::MbarrierPtr { bar_id });
+                        } else {
+                            let size = int_attr_u64(&op.attributes, "size").unwrap_or(0);
+                            let shared_id = shared_raw_list
+                                .iter()
+                                .position(|(n, _)| n == &short)
+                                .unwrap_or(0);
+                            update(
+                                &mut env,
+                                op.get_result(0),
+                                SsaKind::SharedBasePtr { shared_id, size },
+                            );
+                        }
                     }
                     "mir.cast" => {
                         if op.get_num_operands() == 1
@@ -1371,116 +1439,87 @@ fn translate_verified_2d_tiled_kernel(
                             update(&mut env, op.get_result(0), kind);
                         }
                     }
-                    "mir.mul" => {
+                    "mir.shl" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (Some(SsaKind::TidY), Some(SsaKind::ConstInt { value: s, .. }))
-                            | (Some(SsaKind::ConstInt { value: s, .. }), Some(SsaKind::TidY)) => {
-                                SsaKind::TileRowScaled {
-                                    loop_bound: None,
-                                    stride: u64::try_from(s).unwrap_or(u64::MAX),
-                                }
-                            }
-                            (
-                                Some(SsaKind::LoopStep { bound }),
-                                Some(SsaKind::ConstInt { value: s, .. }),
-                            )
-                            | (
-                                Some(SsaKind::ConstInt { value: s, .. }),
-                                Some(SsaKind::LoopStep { bound }),
-                            ) => SsaKind::TileRowScaled {
-                                loop_bound: Some(bound),
-                                stride: u64::try_from(s).unwrap_or(u64::MAX),
-                            },
-                            (
-                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
-                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
-                            )
-                            | (
-                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
-                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
-                            ) => SsaKind::StripColStrided,
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(SsaKind::ConstInt { value: sh, .. })) =
+                            (lhs.as_ref().and_then(as_idx_expr), rhs)
+                            && sh < 16
+                            && a.has_coord()
+                        {
+                            SsaKind::Index(IdxExpr::Mul(
+                                Box::new(a),
+                                Box::new(IdxExpr::Const(1u64 << sh)),
+                            ))
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
-                    "mir.add" => {
+                    "mir.mul" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && (a.has_coord() || b.has_coord())
+                        {
+                            SsaKind::Index(IdxExpr::Mul(Box::new(a), Box::new(b)))
+                        } else if matches!(
+                            (&lhs, &rhs),
                             (
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: None,
-                                    stride,
-                                }),
-                                Some(SsaKind::TidX),
+                                Some(SsaKind::Index(IdxExpr::Ty) | SsaKind::StripRowOffset),
+                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
+                            ) | (
+                                Some(SsaKind::DataValue | SsaKind::BufferParam(_)),
+                                Some(SsaKind::Index(IdxExpr::Ty) | SsaKind::StripRowOffset),
                             )
-                            | (
-                                Some(SsaKind::TidX),
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: None,
-                                    stride,
-                                }),
-                            ) => SsaKind::TileCoord2D {
-                                pattern: TileAccessPatternKind::ThreadSlot { stride },
-                                loop_bound: 1,
-                            },
+                        ) {
+                            SsaKind::StripColStrided
+                        } else {
+                            SsaKind::DataValue
+                        };
+                        update(&mut env, op.get_result(0), mapped);
+                    }
+                    "mir.add" | "mir.bitor" => {
+                        let lhs = env.get_kind(&op.get_operand(0));
+                        let rhs = env.get_kind(&op.get_operand(1));
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && (a.has_coord() || b.has_coord())
+                        {
+                            SsaKind::Index(IdxExpr::Add(Box::new(a), Box::new(b)))
+                        } else if matches!(
+                            (&lhs, &rhs),
                             (
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: None,
-                                    stride,
-                                }),
-                                Some(SsaKind::LoopStep { bound }),
-                            )
-                            | (
-                                Some(SsaKind::LoopStep { bound }),
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: None,
-                                    stride,
-                                }),
-                            ) => SsaKind::TileCoord2D {
-                                pattern: TileAccessPatternKind::RowScan { stride },
-                                loop_bound: bound,
-                            },
-                            (
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: Some(bound),
-                                    stride,
-                                }),
-                                Some(SsaKind::TidX),
-                            )
-                            | (
-                                Some(SsaKind::TidX),
-                                Some(SsaKind::TileRowScaled {
-                                    loop_bound: Some(bound),
-                                    stride,
-                                }),
-                            ) => SsaKind::TileCoord2D {
-                                pattern: TileAccessPatternKind::ColScan { stride },
-                                loop_bound: bound,
-                            },
-                            (
-                                Some(SsaKind::TidX | SsaKind::StripColOffset),
+                                Some(SsaKind::Index(IdxExpr::Tx) | SsaKind::StripColOffset),
                                 Some(SsaKind::DataValue),
-                            )
-                            | (
+                            ) | (
                                 Some(SsaKind::DataValue),
-                                Some(SsaKind::TidX | SsaKind::StripColOffset),
-                            ) => SsaKind::StripColOffset,
+                                Some(SsaKind::Index(IdxExpr::Tx) | SsaKind::StripColOffset),
+                            )
+                        ) {
+                            SsaKind::StripColOffset
+                        } else if matches!(
+                            (&lhs, &rhs),
                             (
-                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
+                                Some(SsaKind::Index(IdxExpr::Ty) | SsaKind::StripRowOffset),
                                 Some(SsaKind::DataValue),
+                            ) | (
+                                Some(SsaKind::DataValue),
+                                Some(SsaKind::Index(IdxExpr::Ty) | SsaKind::StripRowOffset),
                             )
-                            | (
-                                Some(SsaKind::DataValue),
-                                Some(SsaKind::TidY | SsaKind::StripRowOffset),
-                            ) => SsaKind::StripRowOffset,
+                        ) {
+                            SsaKind::StripRowOffset
+                        } else if matches!(
+                            (&lhs, &rhs),
                             (Some(SsaKind::StripColStrided), Some(SsaKind::DataValue))
-                            | (Some(SsaKind::DataValue), Some(SsaKind::StripColStrided)) => {
-                                SsaKind::StripColStrided
-                            }
-                            _ => SsaKind::DataValue,
+                                | (Some(SsaKind::DataValue), Some(SsaKind::StripColStrided))
+                        ) {
+                            SsaKind::StripColStrided
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
@@ -1497,40 +1536,20 @@ fn translate_verified_2d_tiled_kernel(
                     "mir.lt" => {
                         let lhs = env.get_kind(&op.get_operand(0));
                         let rhs = env.get_kind(&op.get_operand(1));
-                        let mapped = match (lhs, rhs) {
-                            (
-                                Some(SsaKind::TileCoord2D {
-                                    pattern,
-                                    loop_bound,
-                                }),
-                                Some(SsaKind::ConstInt { value: size, .. }),
-                            ) => SsaKind::SharedIndexLtLen {
-                                size: u64::try_from(size).unwrap_or(u64::MAX),
-                                pattern,
-                                loop_bound,
-                            },
-                            (Some(SsaKind::TidX), Some(SsaKind::ConstInt { value: size, .. })) => {
-                                SsaKind::SharedIndexLtLen {
-                                    size: u64::try_from(size).unwrap_or(u64::MAX),
-                                    pattern: TileAccessPatternKind::ThreadSlot {
-                                        stride: u64::from(spec.block_size),
-                                    },
-                                    loop_bound: 1,
-                                }
-                            }
-                            (
-                                Some(SsaKind::LoopStep { bound }),
-                                Some(SsaKind::ConstInt { value: size, .. }),
-                            ) => SsaKind::SharedIndexLtLen {
-                                size: u64::try_from(size).unwrap_or(u64::MAX),
-                                pattern: TileAccessPatternKind::LinearScan,
-                                loop_bound: bound,
-                            },
-                            (
-                                Some(SsaKind::StripColOffset | SsaKind::StripColStrided),
-                                Some(SsaKind::SliceLen(guard_param)),
-                            ) => SsaKind::IndexLtLen { guard_param },
-                            _ => SsaKind::DataValue,
+                        let mapped = if let (Some(a), Some(b)) = (
+                            lhs.as_ref().and_then(as_idx_expr),
+                            rhs.as_ref().and_then(as_idx_expr),
+                        ) && a.has_coord()
+                        {
+                            SsaKind::Guard(GuardExpr::Lt(a, b))
+                        } else if let (
+                            Some(SsaKind::StripColOffset | SsaKind::StripColStrided),
+                            Some(SsaKind::SliceLen(guard_param)),
+                        ) = (lhs, rhs)
+                        {
+                            SsaKind::IndexLtLen { guard_param }
+                        } else {
+                            SsaKind::DataValue
                         };
                         update(&mut env, op.get_result(0), mapped);
                     }
@@ -1539,11 +1558,9 @@ fn translate_verified_2d_tiled_kernel(
                         let idx = env.get_kind(&op.get_operand(1));
                         if let (
                             Some(SsaKind::SharedBasePtr { shared_id, size }),
-                            Some(SsaKind::TileCoord2D {
-                                pattern,
-                                loop_bound,
-                            }),
+                            Some(SsaKind::Index(addr)),
                         ) = (base.clone(), idx.clone())
+                            && addr.has_coord()
                         {
                             update(
                                 &mut env,
@@ -1551,40 +1568,7 @@ fn translate_verified_2d_tiled_kernel(
                                 SsaKind::SharedElementPtr {
                                     shared_id,
                                     size,
-                                    pattern,
-                                    loop_bound,
-                                },
-                            );
-                        } else if let (
-                            Some(SsaKind::SharedBasePtr { shared_id, size }),
-                            Some(SsaKind::TidX),
-                        ) = (base.clone(), idx.clone())
-                        {
-                            update(
-                                &mut env,
-                                op.get_result(0),
-                                SsaKind::SharedElementPtr {
-                                    shared_id,
-                                    size,
-                                    pattern: TileAccessPatternKind::ThreadSlot {
-                                        stride: u64::from(spec.block_size),
-                                    },
-                                    loop_bound: 1,
-                                },
-                            );
-                        } else if let (
-                            Some(SsaKind::SharedBasePtr { shared_id, size }),
-                            Some(SsaKind::LoopStep { bound }),
-                        ) = (base.clone(), idx.clone())
-                        {
-                            update(
-                                &mut env,
-                                op.get_result(0),
-                                SsaKind::SharedElementPtr {
-                                    shared_id,
-                                    size,
-                                    pattern: TileAccessPatternKind::LinearScan,
-                                    loop_bound: bound,
+                                    addr,
                                 },
                             );
                         } else if let (
@@ -1630,60 +1614,160 @@ fn translate_verified_2d_tiled_kernel(
         }
     }
 
-    // 4b. Identify blocks dominated by a group-leader branch (`if lane == 0` /
-    //     `if tid % group_size == 0` / `if tid == 0`).
-    let mut leader_branch_pairs: Vec<(usize, usize)> = Vec::new();
-    for &b_ptr in &blocks {
+    // 4b. Collect thread-coordinate branch guards (`GuardExpr`) and async `mbarrier`
+    //     token chains (`StageProduced` -> `StageReady`) from `mir.cond_br`.
+    let mut branch_guards: Vec<(usize, usize, GuardExpr)> = Vec::new();
+    let mut arrived_expect_tx_bars: BTreeSet<usize> = BTreeSet::new();
+    let mut async_bar_for_shared: HashMap<usize, usize> = HashMap::new();
+    let mut mbarrier_wait_edges: Vec<(usize, usize, usize)> = Vec::new();
+    for (w_blk, &b_ptr) in blocks.iter().enumerate() {
         for op_ptr in b_ptr.deref(ctx).iter(ctx) {
-            if Operation::get_opid(op_ptr, ctx).to_string() == "mir.cond_br" {
-                let op = op_ptr.deref(ctx);
-                if op.get_num_operands() >= 1 && op.get_num_successors() == 2 {
-                    let cond_kind = env.get_kind(&op.get_operand(0));
-                    let true_succ = op.get_successor(0);
-                    let false_succ = op.get_successor(1);
-                    if let (Some(t_idx), Some(f_idx)) = (
-                        blocks.iter().position(|&b| b == true_succ),
-                        blocks.iter().position(|&b| b == false_succ),
-                    ) {
-                        match cond_kind {
-                            Some(SsaKind::IsGroupLeader { .. }) => {
-                                leader_branch_pairs.push((t_idx, f_idx));
+            let opid = Operation::get_opid(op_ptr, ctx).to_string();
+            let op = op_ptr.deref(ctx);
+            if matches!(
+                opid.as_str(),
+                "nvvm.mbarrier_arrive_expect_tx_shared" | "nvvm.mbarrier_arrive_expect_tx_cluster"
+            ) && op.get_num_operands() >= 1
+                && let Some(SsaKind::MbarrierPtr { bar_id }) = env.get_kind(&op.get_operand(0))
+            {
+                arrived_expect_tx_bars.insert(bar_id);
+            } else if opid.starts_with("nvvm.cp_async_bulk_tensor_g2s")
+                && op.get_num_operands() >= 2
+                && let (
+                    Some(SsaKind::SharedBasePtr { shared_id, .. }),
+                    Some(SsaKind::MbarrierPtr { bar_id }),
+                ) = (
+                    env.get_kind(&op.get_operand(0)),
+                    env.get_kind(&op.get_operand(1)),
+                )
+            {
+                async_bar_for_shared.insert(shared_id, bar_id);
+            } else if opid == "mir.cond_br"
+                && op.get_num_operands() >= 1
+                && op.get_num_successors() == 2
+            {
+                let cond_kind = env.get_kind(&op.get_operand(0));
+                let true_succ = op.get_successor(0);
+                let false_succ = op.get_successor(1);
+                if let (Some(t_idx), Some(f_idx)) = (
+                    blocks.iter().position(|&b| b == true_succ),
+                    blocks.iter().position(|&b| b == false_succ),
+                ) {
+                    match cond_kind {
+                        Some(SsaKind::Guard(g)) => {
+                            let is_loop_test = matches!(
+                                &g,
+                                GuardExpr::Lt(a, _) | GuardExpr::Ge(a, _) if a.loop_bound() > 1
+                            );
+                            if !is_loop_test {
+                                if !can_reach(f_idx, t_idx, &succs, num_blocks) {
+                                    branch_guards.push((t_idx, f_idx, g.clone()));
+                                }
+                                if !can_reach(t_idx, f_idx, &succs, num_blocks) {
+                                    branch_guards.push((f_idx, t_idx, g.negate()));
+                                }
                             }
-                            Some(SsaKind::IsNotGroupLeader { .. }) => {
-                                leader_branch_pairs.push((f_idx, t_idx));
-                            }
-                            _ => {}
                         }
+                        Some(SsaKind::MbarrierReady { bar_id }) => {
+                            mbarrier_wait_edges.push((w_blk, t_idx, bar_id));
+                        }
+                        Some(SsaKind::MbarrierNotReady { bar_id }) => {
+                            mbarrier_wait_edges.push((w_blk, f_idx, bar_id));
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
-    let is_leader_only_block = |b_idx: usize| -> bool {
-        leader_branch_pairs.iter().any(|&(leader_dst, other_dst)| {
-            !can_reach_without(0, b_idx, leader_dst, &succs, num_blocks)
-                && can_reach_without(leader_dst, b_idx, other_dst, &succs, num_blocks)
-        })
+    let block_guard_expr = |b_idx: usize| -> GuardExpr {
+        let mut guard = GuardExpr::True;
+        for (in_dst, out_dst, g) in &branch_guards {
+            if !can_reach_without(0, b_idx, *in_dst, &succs, num_blocks)
+                && can_reach_without(*in_dst, b_idx, *out_dst, &succs, num_blocks)
+            {
+                guard = guard.and(g.clone());
+            }
+        }
+        guard
     };
+    let is_stage_ready = |b_idx: usize, bar_id: usize| -> bool {
+        arrived_expect_tx_bars.contains(&bar_id)
+            && mbarrier_wait_edges.iter().any(|&(w_blk, ready_dst, b_id)| {
+                b_id == bar_id
+                    && b_idx != w_blk
+                    && !can_reach_without(0, b_idx, ready_dst, &succs, num_blocks)
+                    && can_reach(ready_dst, b_idx, &succs, num_blocks)
+            })
+    };
+    let mut effective_num_barriers = barrier_blocks.len();
+    let mut final_barriers_uniform = barriers_uniform;
+    for &(_w_blk, ready_dst, bar_id) in &mbarrier_wait_edges {
+        if arrived_expect_tx_bars.contains(&bar_id) {
+            let uniform_wait = return_blocks
+                .iter()
+                .all(|&ret_blk| !can_reach_without(0, ret_blk, ready_dst, &succs, num_blocks));
+            if uniform_wait {
+                if effective_num_barriers == 0 {
+                    final_barriers_uniform = true;
+                }
+                effective_num_barriers += 1;
+            } else {
+                final_barriers_uniform = false;
+            }
+        }
+    }
 
     // 5. Collect 2D global strip accesses, phased shared-memory accesses, and
     //    proven `mir.assert` nodes (rejecting any verified global slice or
     //    shared-memory `mir.ptr_offset` that did not resolve to a recognized
-    //    2D coordinate pattern).
+    //    coordinate expression).
     let mut global_strip_accesses = Vec::new();
     let mut shared_accesses = Vec::new();
     let mut proven_assert_ops = Vec::new();
     for (b_idx, &b_ptr) in blocks.iter().enumerate() {
-        let leader_only = is_leader_only_block(b_idx);
-        let mut seen_barrier_in_block = false;
+        let dom_guard = block_guard_expr(b_idx);
+        let leader_only = dom_guard.has_zero_leader_check();
+        let active_threads = dom_guard.active_threads_bound(u64::from(spec.block_size));
+        let residual_guard = dom_guard.custom_residual();
+        let mut seen_barriers_in_block = 0usize;
         for op_ptr in b_ptr.deref(ctx).iter(ctx) {
             let opid = Operation::get_opid(op_ptr, ctx).to_string();
             if opid == "nvvm.barrier0" {
-                seen_barrier_in_block = true;
+                seen_barriers_in_block += 1;
                 continue;
             }
-            let phase = block_phase(b_idx, seen_barrier_in_block);
+            let base_phase = block_phase(b_idx, seen_barriers_in_block);
             let op = op_ptr.deref(ctx);
+            if opid.starts_with("nvvm.cp_async_bulk_tensor_g2s") {
+                if op.get_num_operands() >= 2
+                    && let (
+                        Some(SsaKind::SharedBasePtr { shared_id, size }),
+                        Some(SsaKind::MbarrierPtr { .. }),
+                    ) = (
+                        env.get_kind(&op.get_operand(0)),
+                        env.get_kind(&op.get_operand(1)),
+                    )
+                {
+                    let shared_name = shared_raw_list
+                        .get(shared_id)
+                        .map(|(n, _)| n.clone())
+                        .unwrap_or_else(|| format!("SHARED_{shared_id}"));
+                    shared_accesses.push(PhasedSharedAccess {
+                        kind: AccessKind::Write,
+                        shared_id,
+                        shared_name,
+                        buffer_len: size,
+                        phase: base_phase,
+                        pattern: TileAccessPatternKind::LinearScan,
+                        loop_bound: size,
+                        leader_only,
+                        active_threads,
+                        guard: GuardExpr::True,
+                    });
+                }
+                continue;
+            }
             match opid.as_str() {
                 "mir.ptr_offset" => {
                     if let Some(SsaKind::SharedBasePtr { .. }) = env.get_kind(&op.get_operand(0))
@@ -1713,7 +1797,7 @@ fn translate_verified_2d_tiled_kernel(
                 "mir.assert" => {
                     if op.get_num_operands() == 1 {
                         match env.get_kind(&op.get_operand(0)) {
-                            Some(SsaKind::SharedIndexLtLen { .. })
+                            Some(SsaKind::Guard(GuardExpr::Lt(_, _)))
                                 if !spec.no_oob_shared.is_empty() =>
                             {
                                 proven_assert_ops.push(op_ptr);
@@ -1731,9 +1815,24 @@ fn translate_verified_2d_tiled_kernel(
                     Some(SsaKind::SharedElementPtr {
                         shared_id,
                         size,
-                        pattern,
-                        loop_bound,
+                        addr,
                     }) => {
+                        let mut phase = base_phase;
+                        if let Some(&bar_id) = async_bar_for_shared.get(&shared_id)
+                            && is_stage_ready(b_idx, bar_id)
+                        {
+                            phase += 1;
+                        }
+                        let (pattern, loop_bound) = addr.classify_pattern(spec.block_size);
+                        let guard = if matches!(
+                            pattern,
+                            TileAccessPatternKind::Expr(_) | TileAccessPatternKind::ColScan { .. }
+                        ) && active_threads < u64::from(spec.block_size)
+                        {
+                            dom_guard.clone()
+                        } else {
+                            residual_guard.clone()
+                        };
                         let shared_name = shared_raw_list
                             .get(shared_id)
                             .map(|(n, _)| n.clone())
@@ -1747,6 +1846,8 @@ fn translate_verified_2d_tiled_kernel(
                             pattern,
                             loop_bound,
                             leader_only,
+                            active_threads,
+                            guard,
                         });
                     }
                     Some(SsaKind::GlobalStripElementPtr { param, kind }) => {
@@ -1758,10 +1859,25 @@ fn translate_verified_2d_tiled_kernel(
                     if let Some(SsaKind::SharedElementPtr {
                         shared_id,
                         size,
-                        pattern,
-                        loop_bound,
+                        addr,
                     }) = env.get_kind(&op.get_operand(0))
                     {
+                        let mut phase = base_phase;
+                        if let Some(&bar_id) = async_bar_for_shared.get(&shared_id)
+                            && is_stage_ready(b_idx, bar_id)
+                        {
+                            phase += 1;
+                        }
+                        let (pattern, loop_bound) = addr.classify_pattern(spec.block_size);
+                        let guard = if matches!(
+                            pattern,
+                            TileAccessPatternKind::Expr(_) | TileAccessPatternKind::ColScan { .. }
+                        ) && active_threads < u64::from(spec.block_size)
+                        {
+                            dom_guard.clone()
+                        } else {
+                            residual_guard.clone()
+                        };
                         let shared_name = shared_raw_list
                             .get(shared_id)
                             .map(|(n, _)| n.clone())
@@ -1775,6 +1891,8 @@ fn translate_verified_2d_tiled_kernel(
                             pattern,
                             loop_bound,
                             leader_only,
+                            active_threads,
+                            guard,
                         });
                     }
                 }
@@ -1786,8 +1904,8 @@ fn translate_verified_2d_tiled_kernel(
 
     Ok(TranslatedFunction::TiledKernel2D {
         spec,
-        num_barriers: barrier_blocks.len(),
-        barriers_uniform,
+        num_barriers: effective_num_barriers,
+        barriers_uniform: final_barriers_uniform,
         global_strip_accesses,
         shared_accesses,
         proven_assert_ops,
